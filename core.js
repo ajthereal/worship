@@ -544,7 +544,7 @@ function matchSong(title, songs) {
 function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 7); }
 function nowISO() { return new Date().toISOString(); }
 
-var SONG_COLS = ['id', 'title', 'artist', 'key', 'bpm', 'time', 'chart', 'yt', 'marks', 'notes', 'patch', 'updated', 'deleted'];
+var SONG_COLS = ['id', 'title', 'artist', 'key', 'bpm', 'time', 'chart', 'yt', 'marks', 'notes', 'patch', 'audio', 'audioName', 'grid', 'updated', 'deleted'];
 var SET_COLS = ['id', 'date', 'name', 'items', 'raw', 'updated', 'deleted'];
 
 function normRow(r, cols) {
@@ -894,7 +894,32 @@ async function analyzeAudio(samples, sr, opts) {
     return { start: bars[idx].start, end: bars[idx].end, nc: !!p.nc, root: p.root, minor: p.minor, conf: p.conf, name: p.nc ? 'N.C.' : noteName(p.root, flats) + (p.minor ? 'm' : '') };
   });
   onP(1, 'Done');
-  return { bpm: Math.round(bpm * 10) / 10, bpmConf: bpmConf, key: key, keyName: key.name, beatsPerBar: bpb, bars: chords, duration: maxN / sr };
+  return { bpm: Math.round(bpm * 10) / 10, bpmConf: bpmConf, key: key, keyName: key.name, beatsPerBar: bpb, bars: chords, duration: maxN / sr, frames: { chroma: chroma, energy: energy, hop: H2, N: N2, sr: sr } };
+}
+
+// Chord guesses for time ranges (cells of the beat grid) from the chroma frames that analyzeAudio returns.
+// ranges: [[t0,t1],...]. Returns [{nc, root, minor, conf, name}] with names spelled for keyName.
+function chordsForRanges(frames, ranges, keyName) {
+  var flats = keyName ? usesFlats(keyName) : false;
+  return ranges.map(function (r) {
+    var acc = new Float32Array(12), n = 0, en = 0;
+    var from = r[0] + 0.15 * (r[1] - r[0]);
+    var f0 = Math.max(0, Math.floor((from * frames.sr - frames.N / 2) / frames.hop)), nfr = frames.chroma.length;
+    for (var f = f0; f < nfr; f++) {
+      var fs = (f * frames.hop + frames.N / 2) / frames.sr;
+      if (fs >= r[1]) break;
+      if (fs >= from) { for (var q = 0; q < 12; q++) acc[q] += frames.chroma[f][q]; en += frames.energy[f]; n++; }
+    }
+    if (!n || en / n < 1e-7) return { nc: true, root: -1, minor: false, conf: 0, name: 'N.C.' };
+    var best = 0, bs = -1, second = -1;
+    for (var s = 0; s < TEMPLATES.length; s++) {
+      var e = cosSim(acc, TEMPLATES[s].v);
+      if (e > bs) { second = bs; bs = e; best = s; } else if (e > second) second = e;
+    }
+    var conf = Math.max(0, Math.min(1, (bs - 0.55) / 0.35)) * (0.6 + 0.4 * Math.min(1, (bs - second) * 8));
+    var T = TEMPLATES[best];
+    return { nc: false, root: T.root, minor: T.minor, conf: conf, name: noteName(T.root, flats) + (T.minor ? 'm' : '') };
+  });
 }
 
 // Turn analysis bars into chart text, shifted into targetKey (song key) if given.
@@ -922,6 +947,565 @@ function fmtDate(iso, withYear) {
   return DOW[d.getDay()] + ' ' + d.getDate() + ' ' + MON[d.getMonth()] + (withYear ? ' ' + d.getFullYear() : '');
 }
 
+/* ====================================================================
+   Lead sheet model (v3): typed bar syntax, transposing, grid math,
+   chart -> sheet conversion, storage rows for the wsheets tab.
+   ==================================================================== */
+
+/* ---------- time signatures ---------- */
+function parseTime(t) {
+  var m = /^\s*(\d+)\s*\/\s*(\d+)\s*$/.exec(String(t || '4/4'));
+  if (!m) return { n: 4, d: 4 };
+  var n = Number(m[1]), d = Number(m[2]);
+  if (!n || (d !== 2 && d !== 4 && d !== 8)) return { n: 4, d: 4 };
+  return { n: n, d: d };
+}
+// sub = units per whole note (8 means eighths, 16 means sixteenths).
+function timeInfo(time, sub) {
+  sub = sub || 8;
+  var t = parseTime(time);
+  var unitsPerQuarter = sub / 4, unitsPerEighth = sub / 8;
+  var units = t.d === 4 ? t.n * unitsPerQuarter : t.d === 8 ? t.n * unitsPerEighth : t.n * unitsPerQuarter * 2;
+  var compound = t.d === 8 && t.n % 3 === 0 && t.n > 3;
+  var bu = compound ? 3 * unitsPerEighth : t.d === 4 ? unitsPerQuarter : t.d === 8 ? unitsPerEighth : unitsPerQuarter * 2;
+  return { n: t.n, d: t.d, sub: sub, units: units, bu: bu, beats: Math.round(units / bu), compound: compound, time: t.n + '/' + t.d };
+}
+
+function emptySheet(key, time, tempo) {
+  var k = parseKey(key) || parseKey('C');
+  return { v: 1, key: key || 'C', mode: k.minor ? 'minor' : 'major', time: time || '4/4', tempo: tempo || 90, sub: 8, bars: [] };
+}
+
+// Resolve key, time and tempo in force for every bar.
+function resolveBars(sheet) {
+  var key = sheet.key || 'C', time = sheet.time || '4/4', tempo = sheet.tempo || 0, sub = sheet.sub || 8;
+  return (sheet.bars || []).map(function (b, i) {
+    if (b.key) key = b.key;
+    if (b.time) time = b.time;
+    if (b.tempo) tempo = b.tempo;
+    var ti = timeInfo(time, sub);
+    if (b.pickup && b.units) ti = Object.assign({}, ti, { units: b.units, beats: Math.max(1, Math.round(b.units / ti.bu)) });
+    return { i: i, bar: b, key: key, time: time, tempo: tempo, units: ti.units, bu: ti.bu, beats: ti.beats, compound: ti.compound, sub: sub, n: ti.n, d: ti.d };
+  });
+}
+
+/* ---------- chord symbols ---------- */
+function normChordSym(s) {
+  return String(s || '').trim().replace(/♯/g, '#').replace(/♭/g, 'b').replace(/[Δ△]/g, 'maj').replace(/∅/g, 'm7b5').replace(/^N\.?C\.?$/i, 'N.C.');
+}
+function isChordSym(s) {
+  s = normChordSym(s);
+  if (s === 'N.C.') return true;
+  var m = /^([A-G][#b]?)(.*?)(?:\/([A-G][#b]?))?$/.exec(s);
+  if (!m) return false;
+  return new RegExp('^(?:maj|min|dim|aug|sus|add|alt|m|M|\\+|°|ø|-|\\d+|[#b]\\d+|\\(|\\))*$').test(m[2]);
+}
+function chordRoot(s) {
+  s = normChordSym(s);
+  var m = /^([A-G][#b]?)(.*?)(?:\/([A-G][#b]?))?$/.exec(s);
+  if (!m) return null;
+  return { root: noteIndex(m[1]), qual: m[2], bass: m[3] ? noteIndex(m[3]) : -1, rootName: m[1], bassName: m[3] || '' };
+}
+function transposeChordSym(s, semis, flats) {
+  s = normChordSym(s);
+  var c = chordRoot(s);
+  if (!c) return s;
+  return noteName(c.root + semis, flats) + c.qual + (c.bass >= 0 ? '/' + noteName(c.bass + semis, flats) : '');
+}
+// Pieces for drawing: root letter, accidental glyph, inline minor, superscript text, bass.
+function chordParts(s, o) {
+  o = o || {};
+  s = normChordSym(s);
+  if (s === 'N.C.') return { nc: true, root: 'N.C.', acc: '', minor: '', sup: '', bass: '', bassAcc: '' };
+  var c = chordRoot(s);
+  if (!c) return { nc: false, root: s, acc: '', minor: '', sup: '', bass: '', bassAcc: '' };
+  var q = c.qual, minor = '';
+  var mm = /^(m|min|-)(?!aj)/.exec(q);
+  if (/^m7b5/.test(q)) { q = 'ø7' + q.slice(4); mm = null; }
+  if (mm) { minor = 'm'; q = q.slice(mm[1].length); }
+  var tri = o.triangle !== false;
+  q = q.replace(/^maj/, tri ? 'Δ' : 'maj').replace(/^M(?=\d)/, tri ? 'Δ' : 'maj');
+  q = q.replace(/dim/g, '°').replace(/b(\d)/g, '♭$1').replace(/#(\d)/g, '♯$1').replace(/^\+/, '+');
+  var bass = c.bassName ? c.bassName.charAt(0) : '', bassAcc = c.bassName ? c.bassName.slice(1).replace('#', '♯').replace('b', '♭') : '';
+  return { nc: false, root: c.rootName.charAt(0), acc: c.rootName.slice(1).replace('#', '♯').replace('b', '♭'), minor: minor, sup: q, bass: bass, bassAcc: bassAcc };
+}
+function chordDisplay(s, o) {
+  var p = chordParts(s, o);
+  return p.nc ? 'N.C.' : p.root + p.acc + p.minor + p.sup + (p.bass ? '/' + p.bass + p.bassAcc : '');
+}
+function nashSym(s, keyStr) {
+  var c = chordRoot(s), k = parseKey(keyStr);
+  if (normChordSym(s) === 'N.C.') return 'N.C.';
+  if (!c || !k) return s;
+  var ref = relMajorRoot(k.root, k.minor);
+  var d = degree(c.root, ref).replace('b', '♭').replace('#', '♯');
+  return d + c.qual.replace(/maj/, 'Δ') + (c.bass >= 0 ? '/' + degree(c.bass, ref).replace('b', '♭').replace('#', '♯') : '');
+}
+var ROMAN = ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII'];
+function romanFor(s, keyStr) {
+  var c = chordRoot(s), k = parseKey(keyStr);
+  if (!c || !k) return '';
+  var ref = relMajorRoot(k.root, k.minor), d = mod12(c.root - ref);
+  var map = { 0: [0, ''], 1: [1, 'b'], 2: [1, ''], 3: [2, 'b'], 4: [2, ''], 5: [3, ''], 6: [3, '#'], 7: [4, ''], 8: [5, 'b'], 9: [5, ''], 10: [6, 'b'], 11: [6, ''] };
+  var e = map[d], num = ROMAN[e[0]], q = c.qual;
+  var minorQ = /^(m|min|dim|ø|°)(?!aj)/.test(q);
+  if (minorQ) num = num.toLowerCase();
+  var out = (e[1] === 'b' ? '♭' : e[1] === '#' ? '♯' : '') + num;
+  if (/^(dim|°)/.test(q)) out += '°'; else if (/^ø|m7b5/.test(q)) out += 'ø';
+  if (/7/.test(q) && !/maj|ø|dim7|°7/.test(q)) out += '⁷';
+  if (c.bass >= 0 && c.bass !== c.root) {
+    var iv = mod12(c.bass - c.root);
+    if (iv === 3 || iv === 4) out += '⁶'; else if (iv === 7) out += '⁶₄';
+  }
+  return out;
+}
+
+/* ---------- pitches ---------- */
+function pitchMidi(p) {
+  var m = /^([A-Ga-g])([#b]?)(-?\d)$/.exec(String(p || '').replace(/♯/g, '#').replace(/♭/g, 'b'));
+  if (!m) return null;
+  var base = NAT[m[1].toUpperCase()] + (m[2] === '#' ? 1 : m[2] === 'b' ? -1 : 0);
+  return (Number(m[3]) + 1) * 12 + base;
+}
+function midiPitch(midi, flats) {
+  var pc = mod12(midi), oct = Math.floor(midi / 12) - 1;
+  return noteName(pc, flats) + oct;
+}
+function transposePitch(p, semis, flats) {
+  var m = pitchMidi(p);
+  return m == null ? p : midiPitch(m + semis, flats);
+}
+
+/* ---------- transposing a whole sheet ---------- */
+function signedShift(from, to) {
+  var s = semitoneShift(from, to);
+  return s > 6 ? s - 12 : s;
+}
+function transposeSheet(sheet, semis, targetKey) {
+  var out = JSON.parse(JSON.stringify(sheet));
+  if (!semis && !targetKey) return out;
+  semis = semis || 0;
+  var tk = targetKey || transposeKeyName(sheet.key, semis);
+  out.key = tk;
+  var kk = parseKey(tk); if (kk) out.mode = kk.minor ? 'minor' : 'major';
+  var curKey = tk;
+  (out.bars || []).forEach(function (b, i) {
+    if (b.key) {
+      var src = sheet.bars[i].key;
+      // keep an explicit accidental style of the target when the tonic matches the sheet tonic
+      b.key = transposeKeyName(src, semis);
+      curKey = b.key;
+    }
+    var flats = usesFlats(curKey);
+    (b.ch || []).forEach(function (c) { c.c = transposeChordSym(c.c, semis, flats); });
+    (b.ev || []).forEach(function (e) { if (e.p && e.p.length) e.p = e.p.map(function (p) { return transposePitch(p, semis, flats); }); });
+  });
+  return out;
+}
+function sheetToKey(sheet, key) {
+  if (!key || !parseKey(key)) return sheet;
+  var s = signedShift(sheet.key, key);
+  if (!s && sheet.key === key) return sheet;
+  return transposeSheet(sheet, s, key);
+}
+
+/* ---------- typed bar syntax ---------- */
+/*
+  One token per beat, separated by spaces. A beat can be split with commas: "A,B" is A on the beat and B on the "and".
+    E        chord on this beat, comp slash
+    E!       chord as a hit (stab)
+    !        hit with no new chord
+    ^B/D#    push: the chord lands one subdivision early, tied into this beat
+    .        hold: continue the last chord (comp keeps one slash per beat, a hit is lengthened)
+    r        rest
+    %        repeat the previous bar (whole bar)
+  Bar lines: | || |: :| |]   Before a bar: [A Intro] rehearsal mark, 1. or 2. ending. (text) is a cue.
+*/
+function splitBeats(str) {
+  return String(str || '').trim().split(/\s+/).filter(Boolean);
+}
+
+// Parse the content of ONE bar. ctx: {units, bu}. Returns {bar:{ch,ev,rep?,text?,mark?,label?,ending?}, errors:[], warnings:[]}
+function parseBarText(text, ctx) {
+  var errors = [], warnings = [], bar = {}, units = ctx.units, bu = ctx.bu;
+  var s = String(text || '');
+  // rehearsal mark
+  var mk = /^\s*\[([^\]]*)\]\s*/.exec(s);
+  if (mk) {
+    s = s.slice(mk[0].length);
+    var ws = mk[1].trim().split(/\s+/);
+    if (ws[0] && /^[A-Z]$/.test(ws[0])) { bar.mark = ws[0]; if (ws.length > 1) bar.label = ws.slice(1).join(' '); }
+    else if (mk[1].trim()) { bar.label = mk[1].trim(); bar.mark = '*'; }
+  }
+  var en = /^\s*([12])\.\s+/.exec(s);
+  if (en) { bar.ending = en[1] + '.'; s = s.slice(en[0].length); }
+  s = s.replace(/\(([^)]*)\)/g, function (all, t) { if (t.trim()) bar.text = bar.text ? bar.text + ' ' + t.trim() : t.trim(); return ' '; });
+  var toks = splitBeats(s);
+  if (toks.length === 1 && toks[0] === '%') { bar.rep = '%'; bar.ch = []; bar.ev = []; return { bar: bar, errors: errors, warnings: warnings }; }
+  if (!toks.length) { return { bar: Object.assign(bar, { ch: [], ev: [] }), errors: ['Empty bar'], warnings: warnings }; }
+  var beats = Math.round(units / bu);
+  if (toks.length > beats) errors.push('Too many beats: ' + toks.length + ' for ' + beats + '. Use "A,B" to split a beat.');
+  var ch = [], ev = [], last = null;
+  function addEv(e) { ev.push(e); last = e; return e; }
+  toks.slice(0, beats).forEach(function (tok, b) {
+    var parts = tok.split(','), start = b * bu;
+    if (bu % parts.length !== 0) { errors.push('Beat ' + (b + 1) + ' has ' + parts.length + ' parts, too many for the grid.'); parts = [parts[0]]; }
+    var len = bu / parts.length;
+    parts.forEach(function (p, j) {
+      var u = start + j * len;
+      if (p === '' || p === '.') {
+        if (last && last.k === 'h' && last.at + last.d === u) last.d += len;
+        else if (last && last.k === 's' && last.at + last.d === u && Math.floor(last.at / bu) === Math.floor(u / bu)) last.d += len;
+        else if (last && last.k === 's') addEv({ at: u, d: len, k: 's' });
+        else addEv({ at: u, d: len, k: 'r' });
+        return;
+      }
+      if (p === 'r' || p === 'R') { addEv({ at: u, d: len, k: 'r' }); return; }
+      if (p === '!') { addEv({ at: u, d: len, k: 'h' }); return; }
+      var push = false, hit = false, sym = p;
+      if (sym.charAt(0) === '^') { push = true; sym = sym.slice(1); }
+      if (/!$/.test(sym)) { hit = true; sym = sym.slice(0, -1); }
+      if (!isChordSym(sym)) { errors.push('"' + p + '" is not a chord. Use r for a rest or . to hold.'); addEv({ at: u, d: len, k: 'r' }); return; }
+      sym = normChordSym(sym);
+      if (push && u === 0) { warnings.push('A push on beat 1 needs the chord in the bar before. Written as a hit.'); push = false; hit = true; }
+      if (push) {
+        if (last && last.at + last.d === u) { last.d -= 1; if (last.d <= 0) { ev.pop(); last = ev[ev.length - 1] || null; } }
+        ch.push({ at: u - 1, c: sym });
+        ev.push({ at: u - 1, d: 1, k: 'h', tie: true });
+        addEv({ at: u, d: len, k: 'h' });
+        return;
+      }
+      ch.push({ at: u, c: sym });
+      addEv({ at: u, d: len, k: hit ? 'h' : 's' });
+    });
+  });
+  while (toks.length < beats) {
+    var u2 = toks.length * bu;
+    if (last && last.k === 'h' && last.at + last.d === u2) last.d += bu;
+    else if (last && last.k === 's') addEv({ at: u2, d: bu, k: 's' });
+    else addEv({ at: u2, d: bu, k: 'r' });
+    toks.push('.');
+  }
+  bar.ch = ch; bar.ev = ev;
+  return { bar: bar, errors: errors, warnings: warnings };
+}
+
+function defaultEvents(units, bu) {
+  var out = [];
+  for (var u = 0; u < units; u += bu) out.push({ at: u, d: Math.min(bu, units - u), k: 's' });
+  return out;
+}
+
+function evSorted(bar, ctx) {
+  var ev = (bar.ev && bar.ev.length) ? bar.ev.slice() : defaultEvents(ctx.units, ctx.bu);
+  return ev.sort(function (a, b) { return a.at - b.at; });
+}
+
+function chordStrFor(c, hit) { return c + (hit ? '!' : ''); }
+
+// Bar content as text (no bar lines). Pitches and details that the text cannot hold are not written.
+function barToText(bar, ctx) {
+  if (bar.rep === '%') return '%';
+  var units = ctx.units, bu = ctx.bu, beats = Math.round(units / bu);
+  var ev = evSorted(bar, ctx), chAt = {}, evAt = {};
+  (bar.ch || []).forEach(function (c) { chAt[c.at] = c.c; });
+  ev.forEach(function (e) { evAt[e.at] = e; });
+  // pushes: a one-unit tied hit just before a beat, with its chord
+  var push = {}, skip = {};
+  ev.forEach(function (e) {
+    if (e.k === 'h' && e.d === 1 && e.tie && (e.at + 1) % bu === 0 && chAt[e.at] != null && evAt[e.at + 1]) {
+      push[(e.at + 1) / bu] = chAt[e.at]; skip[e.at] = true;
+    }
+  });
+  var out = [];
+  for (var b = 0; b < beats; b++) {
+    var start = b * bu, offs = [];
+    for (var u = start + 1; u < start + bu; u++) if (!skip[u] && (chAt[u] != null || evAt[u])) offs.push(u - start);
+    var nparts = 1;
+    if (offs.length) {
+      var cand = [2, 4, bu].filter(function (n, i, a) { return bu % n === 0 && a.indexOf(n) === i; }).sort(function (x, y) { return x - y; });
+      nparts = bu;
+      for (var ci = 0; ci < cand.length; ci++) {
+        var sz = bu / cand[ci];
+        if (offs.every(function (o) { return o % sz === 0; })) { nparts = cand[ci]; break; }
+      }
+    }
+    var sz2 = bu / nparts, toks = [];
+    for (var j = 0; j < nparts; j++) {
+      var uu = start + j * sz2, e2 = evAt[uu], c2 = chAt[uu], tok;
+      if (j === 0 && push[b]) tok = '^' + push[b];
+      else if (c2 != null && !skip[uu]) tok = chordStrFor(c2, e2 && e2.k === 'h');
+      else if (e2 && !skip[uu]) tok = e2.k === 'r' ? 'r' : e2.k === 'h' ? '!' : '.';
+      else tok = '.';
+      // a hit with no chord that only continues the previous hit is a hold
+      if (tok === '!' && j === 0 && !e2) tok = '.';
+      toks.push(tok);
+    }
+    // a continuing slot written as "." after a hit that starts here is just a hold
+    out.push(toks.join(','));
+  }
+  return out.join(' ');
+}
+
+// Whole line(s) with bar lines, marks and endings. Returns text.
+function barsToLine(rs, from, to) {
+  var parts = [];
+  for (var i = from; i < to; i++) {
+    var r = rs[i], b = r.bar, s = '';
+    var prevRep = i > from ? rs[i - 1].bar.repEnd : false;
+    parts.push(b.repStart ? '|:' : (i === from || prevRep ? '|' : '|'));
+    var pre = '';
+    if (b.mark) pre += '[' + (b.mark === '*' ? '' : b.mark + (b.label ? ' ' : '')) + (b.label || '') + '] ';
+    if (b.ending) pre += b.ending + ' ';
+    var cue = b.text ? ' (' + b.text + ')' : '';
+    parts.push(' ' + pre + barToText(b, r) + cue + ' ');
+    if (b.repEnd) parts.push(':|');
+    else if (b.final) parts.push('|]');
+    else if (b.double) parts.push('||');
+  }
+  var s2 = parts.join('');
+  if (!/(\||\]|:\|)$/.test(s2)) s2 += '|';
+  return s2;
+}
+
+// Parse text with several bars. ctxFn(barIndexInOutput) -> {units, bu}. Returns {bars, errors, warnings}.
+function parseBars(text, ctxFn) {
+  var errors = [], warnings = [], bars = [];
+  String(text || '').split(/\n/).forEach(function (line) {
+    var tokens = line.split(/(\|\||\|:|:\||\|\]|\|)/);
+    // tokens: content, bl, content, bl ...
+    var pendingStart = false, any = false, pendingPrefix = '';
+    for (var i = 0; i < tokens.length; i++) {
+      var t = tokens[i];
+      if (i % 2 === 1) {
+        if (t === '|:') pendingStart = true;
+        else if (bars.length) {
+          var lastB = bars[bars.length - 1];
+          if (lastB._lineOpen) {
+            if (t === ':|') lastB.repEnd = true; else if (t === '|]') lastB.final = true; else if (t === '||') lastB.double = true;
+            lastB._lineOpen = false;
+          }
+        }
+        continue;
+      }
+      if (!t.trim()) continue;
+      if (/^\s*(\[[^\]]*\]\s*)?([12]\.\s*)?$/.test(t)) { pendingPrefix += t; continue; }
+      t = pendingPrefix + t; pendingPrefix = '';
+      var ctx = ctxFn(bars.length);
+      var r = parseBarText(t, ctx);
+      r.errors.forEach(function (e) { errors.push('Bar ' + (bars.length + 1) + ': ' + e); });
+      r.warnings.forEach(function (e) { warnings.push('Bar ' + (bars.length + 1) + ': ' + e); });
+      var nb = r.bar;
+      if (pendingStart) { nb.repStart = true; pendingStart = false; }
+      nb._lineOpen = true;
+      bars.push(nb); any = true;
+    }
+  });
+  bars.forEach(function (b) { delete b._lineOpen; });
+  return { bars: bars, errors: errors, warnings: warnings };
+}
+
+function sheetToText(sheet) {
+  var rs = resolveBars(sheet), lines = [], from = 0;
+  for (var i = 1; i <= rs.length; i++) {
+    if (i === rs.length || rs[i].bar.mark) { lines.push(barsToLine(rs, from, i)); from = i; }
+  }
+  return lines.join('\n');
+}
+
+/* ---------- sections, roadmap ---------- */
+function sheetSections(sheet) {
+  var out = [], cur = null;
+  (sheet.bars || []).forEach(function (b, i) {
+    if (b.mark || !cur) {
+      cur = { mark: b.mark || '', label: b.label || (b.mark ? '' : 'Start'), from: i, to: i };
+      out.push(cur);
+    }
+    cur.to = i;
+  });
+  return out;
+}
+function isChorusLabel(l) { return /(chorus|reff?|refrain|tag)/i.test(l || ''); }
+function chorusBarRange(sheet) {
+  var secs = sheetSections(sheet).filter(function (s) { return isChorusLabel(s.label); });
+  return secs;
+}
+
+/* ---------- migration: old chart text -> sheet ---------- */
+function chartToSheet(chart, songKey, time, tempo) {
+  var model = parseChart(chart);
+  var key = (parseKey(songKey) ? songKey : (firstChordKey(model) ? keyLabel(firstChordKey(model).root, firstChordKey(model).minor) : 'C'));
+  var sheet = emptySheet(key, time || '4/4', tempo || 0);
+  var ti = timeInfo(sheet.time, sheet.sub);
+  var pendingKey = null, markCode = 65, curKey = key;
+  model.forEach(function (n) {
+    if (n.type === 'mod') {
+      var nk = n.key;
+      if (!nk && n.delta != null) { var ck = parseKey(curKey); if (ck) nk = { root: mod12(ck.root + n.delta), minor: ck.minor }; }
+      if (nk) { pendingKey = keyLabel(nk.root, nk.minor); curKey = pendingKey; }
+      return;
+    }
+    if (n.type !== 'sec') return;
+    var first = sheet.bars.length, rep = n.rep || 0;
+    n.bars.forEach(function (b, bi) {
+      var bar = { ch: [], ev: [] }, cs = b.chords, cnt = cs.length;
+      if (bi === 0) {
+        bar.mark = String.fromCharCode(Math.min(90, markCode++));
+        if (n.name) bar.label = n.name;
+        if (pendingKey) { bar.key = pendingKey; pendingKey = null; }
+        if (n.cues.length) bar.text = n.cues.join(' ');
+        if (rep > 1) bar.repStart = true;
+      }
+      var slots = ti.beats;
+      for (var u = 0; u < ti.units; u += ti.bu) bar.ev.push({ at: u, d: ti.bu, k: 's' });
+      cs.forEach(function (c, ci) {
+        var beat = Math.min(slots - 1, Math.floor(ci * slots / cnt)), at = beat * ti.bu;
+        var sym = c.nc ? 'N.C.' : noteName(c.root, usesFlats(curKey)) + c.qual + (c.bass >= 0 ? '/' + noteName(c.bass, usesFlats(curKey)) : '');
+        if (c.push && at > 0) {
+          bar.ch.push({ at: at - 1, c: sym });
+          var prev = bar.ev.filter(function (e) { return e.at + e.d === at; })[0];
+          if (prev && prev.d > 1) prev.d -= 1;
+          bar.ev.push({ at: at - 1, d: 1, k: 'h', tie: true });
+          bar.ev.forEach(function (e) { if (e.at === at) e.k = 'h'; });
+        } else {
+          bar.ch.push({ at: at, c: sym });
+          if (c.hit) bar.ev.forEach(function (e) { if (e.at === at) e.k = 'h'; });
+        }
+      });
+      bar.ev.sort(function (x, y) { return x.at - y.at; });
+      if (bi === n.bars.length - 1 && rep > 1) { bar.repEnd = true; bar.times = rep; }
+      sheet.bars.push(bar);
+    });
+    if (first === sheet.bars.length) return;
+  });
+  if (sheet.bars.length) sheet.bars[sheet.bars.length - 1].final = true;
+  return sheet;
+}
+
+/* ---------- beat grid: bar start times ---------- */
+// grid = {b:[bar start seconds...], end: seconds of the end of the last bar}
+function gridFromTempo(bpm, firstDownbeat, bars, beatsPerBar, duration) {
+  var barSec = 60 / bpm * (beatsPerBar || 4), b = [];
+  for (var i = 0; i < bars; i++) b.push(round3(firstDownbeat + i * barSec));
+  return { b: b, end: round3(firstDownbeat + bars * barSec) };
+}
+function round3(x) { return Math.round(x * 1000) / 1000; }
+function gridBarAt(grid, t) {
+  var b = grid && grid.b;
+  if (!b || !b.length) return { bar: -1, frac: 0 };
+  if (t < b[0]) return { bar: -1, frac: 0 };
+  var lo = 0, hi = b.length - 1;
+  while (lo < hi) { var mid = (lo + hi + 1) >> 1; if (b[mid] <= t) lo = mid; else hi = mid - 1; }
+  var end = lo + 1 < b.length ? b[lo + 1] : (grid.end || (b[lo] + (b[lo] - (b[lo - 1] || 0)) || b[lo] + 2));
+  var frac = (t - b[lo]) / Math.max(0.001, end - b[lo]);
+  if (lo === b.length - 1 && t > end) return { bar: -1, frac: 1, over: true };
+  return { bar: lo, frac: Math.min(1, Math.max(0, frac)) };
+}
+function gridTimeAt(grid, bar, frac) {
+  var b = grid && grid.b;
+  if (!b || !b.length) return 0;
+  bar = Math.max(0, Math.min(b.length, bar));
+  var start = bar < b.length ? b[bar] : grid.end;
+  var end = bar + 1 < b.length ? b[bar + 1] : (grid.end || start + 2);
+  return start + (frac || 0) * (end - start);
+}
+function gridBarEnd(grid, bar) { return gridTimeAt(grid, bar + 1, 0); }
+// Taps on bar 1s while the audio plays. taps: seconds. firstBar: index of the first tapped bar. Fills the rest.
+function gridFromTaps(taps, firstBar, totalBars, duration) {
+  var t = taps.slice().sort(function (a, b) { return a - b; });
+  if (!t.length) return null;
+  var iv = [];
+  for (var i = 1; i < t.length; i++) iv.push(t[i] - t[i - 1]);
+  var med = iv.length ? iv.slice().sort(function (a, b) { return a - b; })[Math.floor(iv.length / 2)] : 2;
+  var b = [], k;
+  for (k = 0; k < totalBars; k++) {
+    var rel = k - firstBar;
+    if (rel >= 0 && rel < t.length) b.push(t[rel]);
+    else if (rel < 0) b.push(t[0] + rel * med);
+    else b.push(t[t.length - 1] + (rel - t.length + 1) * med);
+  }
+  b = b.map(round3);
+  return { b: b, end: round3(b[b.length - 1] + med) };
+}
+function gridFromAnalysis(a, totalBars) {
+  if (!a || !a.bars || !a.bars.length) return null;
+  var starts = a.bars.map(function (x) { return x.start; });
+  var med = a.bars[0].end - a.bars[0].start;
+  var b = starts.slice(0, totalBars);
+  while (b.length < totalBars) b.push(b[b.length - 1] + med);
+  b = b.map(round3);
+  return { b: b, end: round3(b[b.length - 1] + med) };
+}
+// Shift every bar start so that bar k starts at time t (keeps spacing)
+function gridSetBar(grid, k, t) {
+  var d = t - grid.b[k];
+  return { b: grid.b.map(function (x) { return round3(x + d); }), end: round3(grid.end + d) };
+}
+// Change the spacing: scale around bar 0 so the bar length becomes barSec
+function gridSetTempo(grid, bpm, beatsPerBar) {
+  var barSec = 60 / bpm * (beatsPerBar || 4), t0 = grid.b[0];
+  var b = grid.b.map(function (x, i) { return round3(t0 + i * barSec); });
+  return { b: b, end: round3(t0 + grid.b.length * barSec) };
+}
+function parseGrid(s) {
+  try { var g = typeof s === 'string' ? JSON.parse(s || 'null') : s; return g && Array.isArray(g.b) && g.b.length ? g : null; } catch (e) { return null; }
+}
+
+/* ---------- storage rows for the wsheets tab ---------- */
+var SHEET_COLS = ['id', 'part', 'data', 'updated', 'deleted'];
+var SHEET_PART = 40000, SHEET_MAX = 300000;
+
+async function deflateBytes(bytes) {
+  if (typeof CompressionStream !== 'undefined') return streamBytes('c', bytes);
+  if (typeof require === 'function') { try { return new Uint8Array(require('zlib').deflateRawSync(Buffer.from(bytes))); } catch (e) { /* fall through */ } }
+  return null;
+}
+async function inflateBytes(bytes) {
+  if (typeof DecompressionStream !== 'undefined') return streamBytes('d', bytes);
+  return new Uint8Array(require('zlib').inflateRawSync(Buffer.from(bytes)));
+}
+// -> {rows, size} or throws Error with a plain message
+async function packSheet(id, sheet, updated) {
+  var json = JSON.stringify(sheet), bytes = new TextEncoder().encode(json);
+  var z = await deflateBytes(bytes), data = z ? 'z' + bytesToB64u(z) : 'r' + bytesToB64u(bytes);
+  if (data.length > SHEET_MAX) throw new Error('This lead sheet is too big to save (' + Math.round(data.length / 1000) + ' KB of ' + Math.round(SHEET_MAX / 1000) + ' KB). Split it into two songs.');
+  var rows = [], n = Math.max(1, Math.ceil(data.length / SHEET_PART));
+  for (var i = 0; i < n; i++) rows.push({ id: id, part: String(i), data: data.slice(i * SHEET_PART, (i + 1) * SHEET_PART), updated: updated || nowISO(), deleted: '' });
+  return { rows: rows, size: data.length };
+}
+async function unpackSheet(rows) {
+  var parts = rows.filter(function (r) { return r.deleted !== '1'; }).slice().sort(function (a, b) { return Number(a.part) - Number(b.part); });
+  if (!parts.length) return null;
+  var data = parts.map(function (r) { return r.data; }).join('');
+  var kind = data.charAt(0), bytes = b64uToBytes(data.slice(1));
+  if (kind === 'z') bytes = await inflateBytes(bytes); else if (kind !== 'r') throw new Error('Unknown sheet format');
+  return JSON.parse(new TextDecoder().decode(bytes));
+}
+function groupSheetRows(rows) {
+  var map = {}, order = [];
+  (rows || []).forEach(function (r) {
+    if (!r || !r.id) return;
+    var id = String(r.id);
+    if (!map[id]) { map[id] = { id: id, updated: '', parts: [] }; order.push(id); }
+    var g = map[id];
+    if (String(r.updated || '') > g.updated) { g.updated = String(r.updated || ''); g.parts = [r]; }
+    else if (String(r.updated || '') === g.updated) g.parts.push(r);
+  });
+  return order.map(function (id) { return map[id]; });
+}
+// Newer group wins as a whole, so parts of an old and a new version never mix.
+function mergeSheetRows(local, remote) {
+  var L = groupSheetRows(local), R = groupSheetRows(remote), map = {}, order = [];
+  R.forEach(function (g) { map[g.id] = g; order.push(g.id); });
+  L.forEach(function (g) {
+    if (!map[g.id]) { map[g.id] = g; order.push(g.id); }
+    else if (g.updated > map[g.id].updated) map[g.id] = g;
+  });
+  var out = [];
+  order.forEach(function (id) { map[id].parts.slice().sort(function (a, b) { return Number(a.part) - Number(b.part); }).forEach(function (r) { out.push(normRow(r, SHEET_COLS)); }); });
+  return out;
+}
+
 var api = {
   SHARP: SHARP, FLAT: FLAT, SONG_COLS: SONG_COLS, SET_COLS: SET_COLS,
   parseKey: parseKey, usesFlats: usesFlats, flatsForRoot: flatsForRoot, keyLabel: keyLabel, noteName: noteName,
@@ -933,8 +1517,17 @@ var api = {
   parseWhatsApp: parseWhatsApp, parseSongLine: parseSongLine, findDate: findDate, matchSong: matchSong, titleScore: titleScore, normTitle: normTitle,
   uid: uid, nowISO: nowISO, normRow: normRow, mergeRows: mergeRows, rowsEqual: rowsEqual,
   tapBpm: tapBpm, encodeShare: encodeShare, decodeShare: decodeShare,
-  makeFFT: makeFFT, detectKey: detectKey, analyzeAudio: analyzeAudio, draftChart: draftChart,
-  todayISO: todayISO, fmtDate: fmtDate
+  makeFFT: makeFFT, detectKey: detectKey, analyzeAudio: analyzeAudio, draftChart: draftChart, chordsForRanges: chordsForRanges,
+  todayISO: todayISO, fmtDate: fmtDate,
+  SHEET_COLS: SHEET_COLS, SHEET_PART: SHEET_PART, SHEET_MAX: SHEET_MAX,
+  parseTime: parseTime, timeInfo: timeInfo, emptySheet: emptySheet, resolveBars: resolveBars,
+  normChordSym: normChordSym, isChordSym: isChordSym, chordRoot: chordRoot, transposeChordSym: transposeChordSym, chordParts: chordParts, chordDisplay: chordDisplay, nashSym: nashSym, romanFor: romanFor,
+  pitchMidi: pitchMidi, midiPitch: midiPitch, transposePitch: transposePitch,
+  signedShift: signedShift, transposeSheet: transposeSheet, sheetToKey: sheetToKey,
+  parseBarText: parseBarText, barToText: barToText, barsToLine: barsToLine, parseBars: parseBars, sheetToText: sheetToText, defaultEvents: defaultEvents, evSorted: evSorted,
+  sheetSections: sheetSections, isChorusLabel: isChorusLabel, chorusBarRange: chorusBarRange, chartToSheet: chartToSheet,
+  gridFromTempo: gridFromTempo, gridBarAt: gridBarAt, gridTimeAt: gridTimeAt, gridBarEnd: gridBarEnd, gridFromTaps: gridFromTaps, gridFromAnalysis: gridFromAnalysis, gridSetBar: gridSetBar, gridSetTempo: gridSetTempo, parseGrid: parseGrid,
+  packSheet: packSheet, unpackSheet: unpackSheet, groupSheetRows: groupSheetRows, mergeSheetRows: mergeSheetRows
 };
 
 if (typeof module !== 'undefined' && module.exports) module.exports = api;

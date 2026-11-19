@@ -199,6 +199,163 @@ function synth(sr, seconds, bpm, chords) {
   });
   await t('draftChart text', () => eq(C.draftChart([{ root: 4, minor: false }, { root: 1, minor: true }, { nc: true }], 'E', 'F'), '[Part 1] | F | Dm | N.C. |'));
 
+  /* ---------- lead sheet model ---------- */
+  console.log('\nLead sheet');
+  const ti = C.timeInfo('4/4', 8);
+  const rt = (txt) => { const r = C.parseBarText(txt, ti); if (r.errors.length) throw new Error(txt + ' -> ' + r.errors.join('; ')); return C.barToText(r.bar, ti); };
+  await t('time info 4/4, 3/4, 6/8, 16ths', () => {
+    eq([ti.units, ti.bu, ti.beats], [8, 2, 4]);
+    const a = C.timeInfo('3/4', 8); eq([a.units, a.bu, a.beats], [6, 2, 3]);
+    const b = C.timeInfo('6/8', 8); eq([b.units, b.bu, b.beats, b.compound], [6, 3, 2, true]);
+    const c = C.timeInfo('4/4', 16); eq([c.units, c.bu], [16, 4]);
+  });
+  await t('typed bars: round trip', () => {
+    for (const x of ['E . . .', 'E . . ^B/D#', 'E! . r r', 'A,B . C .', 'Bsus! B! r r', 'C#m7 . A,B/D# .', 'F#m7 . ^Bsus .', 'r r E! .']) eq(rt(x), x, x);
+  });
+  await t('typed bars: short bar fills with holds', () => eq(rt('E'), 'E . . .'));
+  await t('typed bars: push shortens the previous beat and ties', () => {
+    const r = C.parseBarText('E . . ^B/D#', ti);
+    eq(r.bar.ch, [{ at: 0, c: 'E' }, { at: 5, c: 'B/D#' }]);
+    eq(r.bar.ev.slice(-2), [{ at: 5, d: 1, k: 'h', tie: true }, { at: 6, d: 2, k: 'h' }]);
+    eq(r.bar.ev[2], { at: 4, d: 1, k: 's' });
+  });
+  await t('typed bars: hit holds lengthen, comp holds stay one slash per beat', () => {
+    eq(C.parseBarText('E! . r r', ti).bar.ev, [{ at: 0, d: 4, k: 'h' }, { at: 4, d: 2, k: 'r' }, { at: 6, d: 2, k: 'r' }]);
+    eq(C.parseBarText('E . . .', ti).bar.ev.map(e => e.k + e.d).join(), 's2,s2,s2,s2');
+  });
+  await t('typed bars: errors are plain and positional', () => {
+    eq(C.parseBarText('E . . . .', ti).errors[0].startsWith('Too many beats'), true);
+    eq(/not a chord/.test(C.parseBarText('E Zz . .', ti).errors[0]), true);
+    eq(C.parseBarText('^E . . .', ti).warnings.length, 1);
+    eq(C.parseBarText('A,B,C . . .', ti).errors.length, 1);
+  });
+  await t('typed bars: % repeat, mark, ending, cue', () => {
+    eq(C.parseBarText('%', ti).bar.rep, '%');
+    const m = C.parseBarText('[A Intro] E . . . (Band stop)', ti).bar;
+    eq([m.mark, m.label, m.text], ['A', 'Intro', 'Band stop']);
+    eq(C.parseBarText('1. A . . .', ti).bar.ending, '1.');
+  });
+  await t('typed bars: sixteenths', () => {
+    const t16 = C.timeInfo('4/4', 16);
+    const r = C.parseBarText('E . A,B .', t16);
+    eq(r.errors, []);
+    eq(C.barToText(r.bar, t16), 'E . A,B .');
+    const r2 = C.parseBarText('E . A,.,.,B .', t16);
+    eq(C.barToText(r2.bar, t16), 'E . A,.,.,B .');
+    eq(r2.bar.ch.map(c => c.at), [0, 8, 11]);
+  });
+  await t('multi-bar line with repeats and marks', () => {
+    const r = C.parseBars('[A Intro] |: E . . . | A . . . :| [B Verse] | B! r r r |]', () => ti);
+    eq(r.errors, []);
+    eq(r.bars.length, 3);
+    eq([r.bars[0].mark, r.bars[0].repStart, r.bars[1].repEnd, r.bars[2].mark, r.bars[2].final], ['A', true, true, 'B', true]);
+  });
+  await t('sheet text round trip', () => {
+    const sh = C.emptySheet('E', '4/4', 72);
+    const r = C.parseBars('[A Intro] |: E . . . | A . . . :| [B Verse] | B! r r r || E . . ^B |]', () => ti);
+    sh.bars = r.bars;
+    const txt = C.sheetToText(sh);
+    const r2 = C.parseBars(txt, () => ti);
+    eq(r2.errors, []);
+    eq(C.sheetToText(Object.assign({}, sh, { bars: r2.bars })), txt);
+  });
+  await t('chord parts for display', () => {
+    eq(C.chordParts('C#m7'), { nc: false, root: 'C', acc: '♯', minor: 'm', sup: '7', bass: '', bassAcc: '' });
+    eq(C.chordDisplay('Emaj7'), 'EΔ7');
+    eq(C.chordDisplay('Bsus/D#'), 'Bsus/D♯');
+    eq(C.chordDisplay('Bbadd9'), 'B♭add9');
+    eq(C.chordDisplay('F#m7b5'), 'F♯ø7');
+    eq(C.chordDisplay('N.C.'), 'N.C.');
+  });
+  await t('nashville and roman numerals', () => {
+    eq(C.nashSym('B/D#', 'E'), '5/7'); eq(C.nashSym('C#m7', 'E'), '6m7'); eq(C.nashSym('Bb', 'F'), '4');
+    eq(C.romanFor('E/G#', 'E'), 'I⁶'); eq(C.romanFor('C#m7', 'E'), 'vi⁷'); eq(C.romanFor('D', 'E'), '♭VII'); eq(C.romanFor('A', 'E'), 'IV');
+  });
+  const demo = () => {
+    const s = C.emptySheet('E', '4/4', 72);
+    s.bars = [
+      { mark: 'A', label: 'Intro', ch: [{ at: 0, c: 'Emaj7' }, { at: 4, c: 'F#m7' }], ev: [{ at: 0, d: 8, k: 's' }] },
+      { ch: [{ at: 0, c: 'A' }], ev: [{ at: 0, d: 3, k: 'n', p: ['C#5', 'E5'], a: '>' }, { at: 3, d: 1, k: 'n', p: ['F#4'] }, { at: 4, d: 4, k: 'r' }] },
+      { key: 'F', ch: [{ at: 0, c: 'Bb' }, { at: 4, c: 'C/E' }], ev: [{ at: 0, d: 8, k: 's' }] }
+    ];
+    return s;
+  };
+  await t('transpose sheet: chords, pitches and key signatures', () => {
+    const up = C.transposeSheet(demo(), 1);
+    eq(up.key, 'F');
+    eq(up.bars[0].ch.map(c => c.c), ['Fmaj7', 'Gm7']);
+    eq(up.bars[1].ev[0].p, ['D5', 'F5']);
+    eq(up.bars[1].ev[1].p, ['G4']);
+    eq(up.bars[2].key, 'Gb');
+    eq(up.bars[2].ch.map(c => c.c), ['B', 'Db/F']);
+  });
+  await t('transpose sheet: spelling follows the target key', () => {
+    const dn = C.transposeSheet(demo(), -2);
+    eq(dn.key, 'D'); eq(dn.bars[0].ch.map(c => c.c), ['Dmaj7', 'Em7']);
+    const e2 = C.transposeSheet(C.emptySheet('E'), 3); eq(e2.key, 'G');
+    const fl = C.transposeSheet(demo(), 1);
+    eq(fl.bars[1].ch[0].c, 'Bb');
+  });
+  await t('sheetToKey picks the short way round', () => {
+    const k = C.sheetToKey(demo(), 'D'); eq(k.key, 'D');
+    eq(k.bars[1].ev[1].p, ['E4']);
+    eq(C.sheetToKey(demo(), 'E').key, 'E');
+  });
+  await t('chart text -> sheet migration', () => {
+    const sh = C.chartToSheet('[Intro] | E | B/D# | C#m | A |\n[Chorus] | A B | C#m7 B/D# | x2\n>> F\n[Chorus] | Bb | C |', 'E', '4/4', 72);
+    eq(sh.key, 'E'); eq(sh.bars.length, 8);
+    eq([sh.bars[0].mark, sh.bars[0].label, sh.bars[4].mark, sh.bars[4].label], ['A', 'Intro', 'B', 'Chorus']);
+    eq(sh.bars[4].ch, [{ at: 0, c: 'A' }, { at: 4, c: 'B' }]);
+    eq([sh.bars[4].repStart, sh.bars[5].repEnd, sh.bars[5].times], [true, true, 2]);
+    eq(sh.bars[6].key, 'F'); eq(sh.bars[6].ch[0].c, 'Bb');
+    eq(sh.bars[7].final, true);
+  });
+  await t('grid math', () => {
+    const g = C.gridFromTempo(120, 1, 8, 4);
+    eq(g.b.slice(0, 3), [1, 3, 5]); eq(g.end, 17);
+    eq(C.gridBarAt(g, 0.5).bar, -1);
+    eq(C.gridBarAt(g, 3.5), { bar: 1, frac: 0.25 });
+    eq(C.gridBarAt(g, 16.9).bar, 7);
+    eq(C.gridBarAt(g, 20).bar, -1);
+    eq(C.gridTimeAt(g, 2, 0.5), 6);
+    eq(C.gridTimeAt(g, 8, 0), 17);
+    const s = C.gridSetBar(g, 0, 2); eq(s.b[0], 2); eq(s.b[1], 4);
+    const q = C.gridSetTempo(g, 60, 4); eq(q.b[1], 5);
+  });
+  await t('grid from taps fills before and after', () => {
+    const g = C.gridFromTaps([2, 4.1, 6.0, 8.1], 1, 8, 20);
+    eq(g.b.length, 8); eq(g.b[1], 2); eq(g.b[4], 8.1); eq(g.b[0] < 2, true); eq(g.b[7] > 8.1, true);
+  });
+  await t('sheet storage: pack, split, unpack', async () => {
+    const sh = demo();
+    const p = await C.packSheet('s1', sh, '2026-11-19T10:00:00Z');
+    eq(p.rows.length, 1); eq(p.rows[0].id, 's1'); eq(p.rows[0].part, '0');
+    eq(await C.unpackSheet(p.rows), sh);
+    const big = C.emptySheet('C', '4/4', 90);
+    let seed = 7; const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+    for (let i = 0; i < 2500; i++) big.bars.push({ ch: [{ at: 0, c: 'C' }], ev: [{ at: 0, d: 8, k: 'n', p: ['C4'] }], text: (rnd() * 1e15).toString(36) + (rnd() * 1e15).toString(36) });
+    const p2 = await C.packSheet('s2', big, 'x');
+    eq(p2.rows.length > 1, true, 'parts ' + p2.rows.length);
+    eq(p2.rows.every(r => r.data.length <= C.SHEET_PART), true);
+    eq(await C.unpackSheet(p2.rows.slice().reverse()), big);
+  });
+  await t('sheet storage: too big gives a plain message', async () => {
+    const big = C.emptySheet('C');
+    let seed = 3; const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+    for (let i = 0; i < 20000; i++) big.bars.push({ text: (rnd() * 1e15).toString(36) + (rnd() * 1e15).toString(36), ch: [], ev: [] });
+    let msg = ''; try { await C.packSheet('x', big, 'u'); } catch (e) { msg = e.message; }
+    eq(/too big/.test(msg), true, msg);
+  });
+  await t('sheet rows merge as whole versions', () => {
+    const L = [{ id: 'a', part: '0', data: 'new0', updated: '2026-11-02', deleted: '' }, { id: 'a', part: '1', data: 'new1', updated: '2026-11-02', deleted: '' }];
+    const R = [{ id: 'a', part: '0', data: 'old0', updated: '2026-11-01', deleted: '' }, { id: 'a', part: '1', data: 'old1', updated: '2026-11-01', deleted: '' }, { id: 'a', part: '2', data: 'old2', updated: '2026-11-01', deleted: '' }, { id: 'b', part: '0', data: 'b0', updated: '2026-11-01', deleted: '' }];
+    const m = C.mergeSheetRows(L, R);
+    eq(m.map(r => r.data), ['new0', 'new1', 'b0']);
+    const m2 = C.mergeSheetRows(R, L); eq(m2.map(r => r.data), ['new0', 'new1', 'b0']);
+    const tomb = C.mergeSheetRows([{ id: 'b', part: '0', data: '', updated: '2026-11-03', deleted: '1' }], R);
+    eq(tomb.filter(r => r.id === 'b')[0].deleted, '1');
+  });
+
   console.log('\n' + pass + ' passed, ' + fail + ' failed');
   if (fail) { console.log('Failed: ' + failures.join('; ')); process.exit(1); }
 })();
