@@ -80,3 +80,7 @@ Plain text, one section per line.
 ## Audio analysis
 
 In `core.js`: FFT written by hand, chroma (12 bins), key by Krumhansl-Schmuckler, tempo by onset-strength autocorrelation (60 to 180 BPM), beat tracking, one chord per bar by major/minor template matching with Viterbi smoothing. It yields to the UI so the page never freezes. It is a guess and is labelled as one.
+
+## Deploy
+
+GitHub Pages serves the `gh-pages` branch (Pages settings are not reachable from Claude's sessions). After every change, push to both: `git push origin main && git push origin main:gh-pages`. Bump the cache version in `sw.js` on each release.
