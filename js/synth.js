@@ -4,17 +4,78 @@
 var WS = window.WS;
 var ctx = null, master = null, comp = null, held = {};
 
+var lastWarn = 0, ka = null, kaUrl = null, unlocked = false;
+
+function warn(msg) {
+  var n = Date.now();
+  if (n - lastWarn < 30000) return;
+  lastWarn = n;
+  if (WS.toast) WS.toast(msg, 5000);
+}
+var NO_SOUND = 'No sound. Turn off Silent mode or turn up the volume, then tap again.';
+
+// Make iOS play Web Audio with the ringer switch on. Leaves the mic mode (play-and-record) alone.
+function setPlaybackSession() {
+  try {
+    var s = navigator.audioSession;
+    if (s && s.type !== 'play-and-record' && s.type !== 'playback') s.type = 'playback';
+  } catch (e) { /* ignore */ }
+}
+
+// Fallback for iOS without navigator.audioSession: a silent looping element switches iOS to the playback category.
+function silentWav() {
+  var rate = 8000, n = 800, b = new ArrayBuffer(44 + n * 2), v = new DataView(b);
+  function str(o, t) { for (var i = 0; i < t.length; i++) v.setUint8(o + i, t.charCodeAt(i)); }
+  str(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); str(8, 'WAVE'); str(12, 'fmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  str(36, 'data'); v.setUint32(40, n * 2, true);
+  return URL.createObjectURL(new Blob([b], { type: 'audio/wav' }));
+}
+function startKeepAlive() {
+  if (navigator.audioSession) return;
+  try {
+    if (Synth.extPlaying && Synth.extPlaying()) return;
+    if (!ka) {
+      kaUrl = silentWav();
+      ka = new Audio(); ka.src = kaUrl; ka.loop = true; ka.volume = 1;
+      ka.setAttribute('playsinline', ''); ka.setAttribute('webkit-playsinline', '');
+    }
+    if (ka.paused) { var p = ka.play(); if (p && p.catch) p.catch(function () { /* blocked until a gesture, retried on the next one */ }); }
+  } catch (e) { /* ignore */ }
+}
+function stopKeepAlive() { try { if (ka && !ka.paused) ka.pause(); } catch (e) { /* ignore */ } }
+
 function ac() {
   if (!ctx) {
     var AC = window.AudioContext || window.webkitAudioContext;
-    if (!AC) return null;
-    ctx = new AC();
+    if (!AC) { warn('No sound. This browser cannot play audio. Open the app in Safari.'); return null; }
+    setPlaybackSession();
+    try { ctx = new AC(); } catch (e) { warn('No sound. The audio could not start: ' + ((e && e.message) || 'unknown error') + '.'); return null; }
     master = ctx.createGain(); master.gain.value = 0.7;
     comp = ctx.createDynamicsCompressor(); comp.threshold.value = -18; comp.ratio.value = 4;
     master.connect(comp); comp.connect(ctx.destination);
   }
-  if (ctx.state === 'suspended') ctx.resume();
+  if (ctx.state !== 'running') resumeCtx();
   return ctx;
+}
+function resumeCtx() {
+  try {
+    var p = ctx.resume();
+    if (p && p.catch) p.catch(function () { /* checked below */ });
+    return p;
+  } catch (e) { return null; }
+}
+// Runs inside a gesture. Warns once per 30 s if the context is still not running after a moment.
+function unlockNow(quiet) {
+  var a = ac(); if (!a) return null;
+  startKeepAlive();
+  if (a.state !== 'running') {
+    var p = resumeCtx();
+    if (!quiet) setTimeout(function () { if (ctx && ctx.state !== 'running') warn(NO_SOUND); }, 400);
+    return p;
+  }
+  return null;
 }
 function hz(midi) { return 440 * Math.pow(2, (midi - 69) / 12); }
 
@@ -23,6 +84,24 @@ var PARTS = [[1, 1, 1.6], [2, 0.42, 1.0], [3, 0.2, 0.7], [4, 0.1, 0.45], [5.01, 
 
 function voice(midi, vel, hold) {
   var a = ac(); if (!a) return null;
+  if (a.state !== 'running') {
+    // The context is still waking up. Play the note as soon as it runs so the first tap is not lost.
+    var pend = { stopped: false, midi: midi, real: null };
+    pend.stop = function (rel) { pend.stopped = true; if (pend.real) pend.real.stop(rel); };
+    var go = function () {
+      if (pend.stopped) return;
+      if (ctx.state !== 'running') return;
+      pend.real = build(midi, vel, hold);
+    };
+    var p = resumeCtx();
+    if (p && p.then) p.then(go, function () { /* warned by the unlock check */ });
+    setTimeout(function () { if (ctx && ctx.state !== 'running') warn(NO_SOUND); }, 400);
+    return pend;
+  }
+  return build(midi, vel, hold);
+}
+function build(midi, vel, hold) {
+  var a = ctx;
   var t0 = a.currentTime, f = hz(midi), g = a.createGain(), lp = a.createBiquadFilter();
   lp.type = 'lowpass'; lp.frequency.value = Math.min(9000, 1800 + f * 4); lp.Q.value = 0.3;
   var peak = 0.22 * (vel == null ? 0.8 : vel);
@@ -55,7 +134,8 @@ function voice(midi, vel, hold) {
 
 var Synth = {
   available: function () { return !!(window.AudioContext || window.webkitAudioContext); },
-  unlock: function () { return ac(); },
+  unlock: function () { return unlockNow(); },
+  extPlaying: null,
   state: function () { return ctx ? ctx.state : 'none'; },
   note: function (midi, vel) { return voice(midi, vel, false); },
   chord: function (midis, o) {
@@ -99,4 +179,16 @@ var Synth = {
   }
 };
 WS.Synth = Synth;
+
+// Global unlock: the first real gesture creates and resumes the context. Later gestures only act if it fell asleep.
+function onGesture() {
+  if (!unlocked) { unlocked = true; unlockNow(true); return; }
+  if (ctx && ctx.state !== 'running') unlockNow(true);
+  else startKeepAlive();
+}
+document.addEventListener('pointerdown', onGesture, true);
+document.addEventListener('touchend', onGesture, true);
+document.addEventListener('visibilitychange', function () {
+  if (document.hidden) { stopKeepAlive(); }
+});
 })();

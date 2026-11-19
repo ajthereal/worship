@@ -344,6 +344,7 @@ WS.viewPractice = function (v) {
 /* ---------------- Listen ---------------- */
 var SPEEDS = [1, 0.9, 0.75, 0.6, 0.5];
 var L = { el: null };
+WS.Synth.extPlaying = function () { return !!(L.el && !L.el.paused); };
 WS.viewListen = function (v) {
   var root = h('div', { class: 'listen' });
   var set = v.setId ? WS.setById(v.setId) : null;
