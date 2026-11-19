@@ -356,6 +356,66 @@ function synth(sr, seconds, bpm, chords) {
     eq(tomb.filter(r => r.id === 'b')[0].deleted, '1');
   });
 
+  // --- sheet sync simulation (same decision functions the app uses) ---
+  const mkServer = () => ({ rows: [] });
+  const mkDevice = (name) => ({ name, sheets: {}, copies: 0, cf: {} });
+  let clock = Date.parse('2026-11-19T15:47:00.000Z');
+  const tick = () => new Date(clock += 1000).toISOString();
+  const edit = (d, id, v) => { d.sheets[id] = { u: tick(), b: d.sheets[id] ? d.sheets[id].b : '', j: v, w: d.sheets[id] ? d.sheets[id].w : [] }; };
+  // opts.editDuringPost simulates an edit made while the POST is in flight
+  const sync = async (d, srv, opts) => {
+    const remote = srv.rows.map(r => Object.assign({}, r));
+    const groups = C.groupSheetRows(remote);
+    const conflicts = [];
+    for (const g of groups) {
+      const loc = d.sheets[g.id];
+      const act = C.sheetSyncAction(loc, g.updated, d.cf[g.id]);
+      if (act === 'skip') continue;
+      const j = await C.unpackSheet(g.parts);
+      if (act === 'conflict') { conflicts.push({ id: g.id, ru: g.updated, local: loc }); d.cf[g.id] = g.updated; }
+      d.sheets[g.id] = { u: g.updated, b: g.updated, j, w: loc && loc.w ? loc.w : [] };
+    }
+    conflicts.forEach(c => { d.copies++; d.sheets['copy' + d.copies + d.name] = { u: tick(), b: '', j: c.local.j, w: [] }; });
+    const dirty = Object.keys(d.sheets).filter(id => !d.sheets[id].b || C.tsCmp(d.sheets[id].u, d.sheets[id].b) > 0);
+    if (!dirty.length) return;
+    let mine = []; const wrote = {};
+    for (const id of dirty) { const p = await C.packSheet(id, d.sheets[id].j, d.sheets[id].u); wrote[id] = p.rows[0].updated; mine = mine.concat(p.rows); }
+    srv.rows = C.mergeSheetRows(mine, remote);
+    if (opts && opts.editDuringPost) edit(d, dirty[0], { edited: 'during post' });
+    dirty.forEach(id => C.sheetMarkWritten(d.sheets[id], wrote[id]));
+  };
+  await t('sync: one device saving 10 times makes 0 conflict copies', async () => {
+    const srv = mkServer(), d = mkDevice('ipad');
+    for (let i = 0; i < 10; i++) { edit(d, 's1', { n: i }); await sync(d, srv, { editDuringPost: i % 2 === 1 }); await sync(d, srv); }
+    eq(d.copies, 0); eq(Object.keys(d.sheets).length, 1);
+    await sync(d, srv); await sync(d, srv); eq(d.copies, 0);
+    eq(await C.unpackSheet(C.groupSheetRows(srv.rows)[0].parts), d.sheets.s1.j);
+  });
+  await t('sync: two devices editing the same song make exactly 1 conflict copy', async () => {
+    const srv = mkServer(), a = mkDevice('a'), b = mkDevice('b');
+    edit(a, 's1', { v: 'base' }); await sync(a, srv); await sync(b, srv);
+    edit(a, 's1', { v: 'from a' }); edit(b, 's1', { v: 'from b' });
+    await sync(a, srv);
+    await sync(b, srv); await sync(b, srv); await sync(b, srv);
+    eq(b.copies, 1); eq(a.copies, 0);
+    await sync(a, srv); await sync(a, srv); eq(a.copies, 0);
+    eq(b.sheets.s1.j, { v: 'from a' });
+    eq(b.sheets.copy1b.j, { v: 'from b' });
+  });
+  await t('sync: newer remote with no local edits is adopted silently', async () => {
+    const srv = mkServer(), d = mkDevice('ipad');
+    edit(d, 's1', { v: 1 }); await sync(d, srv);
+    const tool = await C.packSheet('s1', { v: 'from analysis' }, '2026-11-19T16:00:00Z');
+    srv.rows = tool.rows;
+    await sync(d, srv); await sync(d, srv);
+    eq(d.copies, 0); eq(d.sheets.s1.j, { v: 'from analysis' });
+    eq(C.sheetSyncAction(null, '2026-11-19T16:00:00Z'), 'adopt');
+  });
+  await t('sync: timestamps compare as instants', () => {
+    eq(C.tsCmp('2026-11-19T15:47:13.500Z', '2026-11-19T15:47:13Z') > 0, true);
+    eq(C.tsCmp('2026-11-19T15:47:13Z', '2026-11-19T15:47:13.000Z'), 0);
+  });
+
   console.log('\n' + pass + ' passed, ' + fail + ' failed');
   if (fail) { console.log('Failed: ' + failures.join('; ')); process.exit(1); }
 })();

@@ -172,7 +172,7 @@ function syncTab(tab) {
   return busy[tab];
 }
 
-function isDirty(loc) { return !!loc && (!loc.b || loc.u > loc.b); }
+function isDirty(loc) { return !!loc && (!loc.b || W.tsCmp(loc.u, loc.b) > 0); }
 function syncSheets() {
   var tab = 'wsheets';
   if (!S.conn) { setSync(); return Promise.resolve(); }
@@ -194,24 +194,25 @@ function syncSheets() {
       var loc = S.sheets[g.id];
       var tomb = g.parts.length && g.parts[0].deleted === '1';
       if (tomb) return;
-      if (!loc || g.updated > (loc.b || '')) {
-        var dirty = isDirty(loc);
+      var act = W.sheetSyncAction(loc, g.updated, S.meta.cfv && S.meta.cfv[g.id]);
+      if (act !== 'skip') {
         jobs.push(W.unpackSheet(g.parts).then(function (sheetObj) {
           if (!sheetObj) return;
-          if (loc && dirty && g.updated > (loc.b || '') && loc.u > (loc.b || '')) conflicts.push({ id: g.id, local: loc });
-          S.sheets[g.id] = { u: g.updated, b: g.updated, j: sheetObj };
+          if (act === 'conflict') conflicts.push({ id: g.id, local: loc, ru: g.updated });
+          S.sheets[g.id] = { u: g.updated, b: g.updated, j: sheetObj, w: loc && loc.w ? loc.w : [] };
         }).catch(function () { /* unreadable remote sheet: keep local */ }));
       }
     });
     return Promise.all(jobs).then(function () {
       conflicts.forEach(function (c) {
+        S.meta.cfv = S.meta.cfv || {}; S.meta.cfv[c.id] = c.ru; // one copy per (song, remote version)
         var song = songById(c.id), title = song ? song.title : 'a song';
         var copyId = W.uid(), stamp = W.fmtDate(W.todayISO()) + ' ' + new Date().toTimeString().slice(0, 5);
         if (song) {
           var cp = W.normRow(Object.assign({}, song, { id: copyId, title: song.title + ' (conflict copy ' + stamp + ')', updated: W.nowISO(), audio: '', audioName: '', grid: '' }), W.SONG_COLS);
           S.songs.push(cp); touch('wsongs');
         }
-        S.sheets[copyId] = { u: W.nowISO(), b: '', j: c.local.j };
+        S.sheets[copyId] = { u: W.nowISO(), b: '', j: c.local.j, w: [] };
         toast('Another device changed "' + title + '" while you were editing. Your version is saved as a conflict copy in Songs.', 8000);
       });
       var dirtyIds = Object.keys(S.sheets).filter(function (id) { return id !== WDemoId() && isDirty(S.sheets[id]); });
@@ -222,7 +223,7 @@ function syncSheets() {
         var merged = W.mergeSheetRows(mine, remoteRows);
         return apiPost(conn, tab, merged).then(function (r) {
           if (r.error) throw r;
-          dirtyIds.forEach(function (id) { if (S.sheets[id].u === packs[dirtyIds.indexOf(id)].rows[0].updated) S.sheets[id].b = S.sheets[id].u; });
+          dirtyIds.forEach(function (id, i) { W.sheetMarkWritten(S.sheets[id], packs[i].rows[0].updated); });
           S.meta.loaded[tab] = true;
         });
       });
@@ -336,7 +337,7 @@ function getSheet(songId) {
 function saveSheet(songId, sheet) {
   if (songId === WDemoId()) { demoSheetObj = sheet; return; }
   var e = S.sheets[songId];
-  S.sheets[songId] = { u: W.nowISO(), b: e ? e.b : '', j: sheet };
+  S.sheets[songId] = { u: W.nowISO(), b: e ? e.b : '', j: sheet, w: e && e.w ? e.w : [] };
   touch('wsheets');
 }
 function hasSheet(songId) { return songId === WDemoId() || !!S.sheets[songId] || (function () { var s = songById(songId); return !!(s && s.chart && s.chart.trim()); })(); }

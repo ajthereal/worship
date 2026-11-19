@@ -1481,6 +1481,28 @@ async function unpackSheet(rows) {
   if (kind === 'z') bytes = await inflateBytes(bytes); else if (kind !== 'r') throw new Error('Unknown sheet format');
   return JSON.parse(new TextDecoder().decode(bytes));
 }
+// Timestamps compare as instants, not strings ("...13Z" and "...13.500Z" differ as text).
+function tsNum(x) { var n = Date.parse(x); return isNaN(n) ? (x ? -1 : -2) : n; }
+function tsCmp(a, b) { var x = tsNum(a), y = tsNum(b); if (x === y && x === -1) return a < b ? -1 : a > b ? 1 : 0; return x < y ? -1 : x > y ? 1 : 0; }
+// Decide what to do with the remote version `ru` of one song, given the local entry {u, b, j, w}.
+// b = version this device last read or wrote, w = versions this device wrote itself, u = last local edit.
+// Returns 'adopt' (take remote), 'conflict' (keep local as a copy, then take remote) or 'skip'.
+function sheetSyncAction(loc, ru, handled) {
+  if (!loc) return 'adopt';
+  if (tsCmp(ru, loc.b || '') <= 0) return 'skip';
+  if ((loc.w || []).some(function (x) { return tsCmp(x, ru) === 0; })) return 'skip';
+  var dirty = !loc.b || tsCmp(loc.u, loc.b) > 0;
+  if (!dirty) return 'adopt';
+  if (handled && handled === ru) return 'skip';
+  return 'conflict';
+}
+// After a successful POST of version `wrote`: it becomes the base and is remembered as our own.
+function sheetMarkWritten(loc, wrote) {
+  var w = (loc.w || []).concat([wrote]).slice(-20);
+  loc.w = w;
+  if (tsCmp(wrote, loc.b || '') > 0) loc.b = wrote;
+  return loc;
+}
 function groupSheetRows(rows) {
   var map = {}, order = [];
   (rows || []).forEach(function (r) {
@@ -1488,8 +1510,9 @@ function groupSheetRows(rows) {
     var id = String(r.id);
     if (!map[id]) { map[id] = { id: id, updated: '', parts: [] }; order.push(id); }
     var g = map[id];
-    if (String(r.updated || '') > g.updated) { g.updated = String(r.updated || ''); g.parts = [r]; }
-    else if (String(r.updated || '') === g.updated) g.parts.push(r);
+    var c = tsCmp(String(r.updated || ''), g.updated);
+    if (c > 0 || !g.parts.length) { g.updated = String(r.updated || ''); g.parts = [r]; }
+    else if (c === 0) g.parts.push(r);
   });
   return order.map(function (id) { return map[id]; });
 }
@@ -1499,7 +1522,7 @@ function mergeSheetRows(local, remote) {
   R.forEach(function (g) { map[g.id] = g; order.push(g.id); });
   L.forEach(function (g) {
     if (!map[g.id]) { map[g.id] = g; order.push(g.id); }
-    else if (g.updated > map[g.id].updated) map[g.id] = g;
+    else if (tsCmp(g.updated, map[g.id].updated) > 0) map[g.id] = g;
   });
   var out = [];
   order.forEach(function (id) { map[id].parts.slice().sort(function (a, b) { return Number(a.part) - Number(b.part); }).forEach(function (r) { out.push(normRow(r, SHEET_COLS)); }); });
@@ -1527,7 +1550,7 @@ var api = {
   parseBarText: parseBarText, barToText: barToText, barsToLine: barsToLine, parseBars: parseBars, sheetToText: sheetToText, defaultEvents: defaultEvents, evSorted: evSorted,
   sheetSections: sheetSections, isChorusLabel: isChorusLabel, chorusBarRange: chorusBarRange, chartToSheet: chartToSheet,
   gridFromTempo: gridFromTempo, gridBarAt: gridBarAt, gridTimeAt: gridTimeAt, gridBarEnd: gridBarEnd, gridFromTaps: gridFromTaps, gridFromAnalysis: gridFromAnalysis, gridSetBar: gridSetBar, gridSetTempo: gridSetTempo, parseGrid: parseGrid,
-  packSheet: packSheet, unpackSheet: unpackSheet, groupSheetRows: groupSheetRows, mergeSheetRows: mergeSheetRows
+  packSheet: packSheet, unpackSheet: unpackSheet, tsCmp: tsCmp, sheetSyncAction: sheetSyncAction, sheetMarkWritten: sheetMarkWritten, groupSheetRows: groupSheetRows, mergeSheetRows: mergeSheetRows
 };
 
 if (typeof module !== 'undefined' && module.exports) module.exports = api;

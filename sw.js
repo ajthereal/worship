@@ -1,5 +1,5 @@
 /* Worship service worker. Bump V when any app file changes, and the ?v= numbers in index.html (they must match). */
-const V = '5';
+const V = '6';
 const CACHE = 'worship-' + V;
 const FONTS = 'worship-fonts';
 const SHELL = [
