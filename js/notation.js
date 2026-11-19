@@ -503,8 +503,20 @@ function render(host, sheet, opts) {
     },
     setLoop: function (from, to) { handle.loop = from == null ? null : [from, to]; Object.keys(barInfo).forEach(function (k) { paint(Number(k)); }); },
     setPlaying: function (i) { handle.playing = i; Object.keys(barInfo).forEach(function (k) { paint(Number(k)); }); },
-    barAt: function (i) { return barInfo[i] || null; }
+    barAt: function (i) { return barInfo[i] || null; },
+    // thin moving line inside the playing bar. frac 0 to 1 across the bar. i null hides it.
+    setBeat: function (i, frac) {
+      var b = i == null ? null : barInfo[i];
+      if (!b) { if (beatLine) beatLine.setAttribute('visibility', 'hidden'); return; }
+      if (!beatLine) { beatLine = el('rect', { width: 2, rx: 1, fill: th.acc, 'pointer-events': 'none', class: 'beat-line' }); svg.appendChild(beatLine); }
+      var x0 = b.noteX != null ? b.noteX : b.x, x1 = b.right != null ? b.right - 4 : b.x + b.w;
+      beatLine.setAttribute('x', (x0 + Math.max(0, Math.min(1, frac || 0)) * (x1 - x0)).toFixed(1));
+      beatLine.setAttribute('y', b.hl.getAttribute('y')); beatLine.setAttribute('height', b.hl.getAttribute('height'));
+      beatLine.setAttribute('visibility', 'visible');
+    },
+    lineOf: function (i) { var b = barInfo[i]; return b ? lineInfo[b.line] : null; }
   };
+  var beatLine = null;
   function paint(i) {
     var b = barInfo[i]; if (!b) return;
     var fill = 'transparent', op = 1;
@@ -573,6 +585,7 @@ function renderGrid(host, sheet, opts) {
     setSelected: function (i) { Object.keys(barRefs).forEach(function (k) { barRefs[k].classList.toggle('sel', Number(k) === i); }); },
     setLoop: function (a, b) { Object.keys(barRefs).forEach(function (k) { barRefs[k].classList.toggle('loop', a != null && Number(k) >= a && Number(k) <= b); }); },
     setPlaying: function (i) { Object.keys(barRefs).forEach(function (k) { barRefs[k].classList.toggle('play', Number(k) === i); }); },
+    setBeat: function () { },
     barEl: function (i) { return barRefs[i]; }
   };
 }

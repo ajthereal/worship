@@ -36,7 +36,7 @@ WS.viewTranscribe = function (v) {
   }
   var T = {
     song: song, sheet: sh, sel: 0, cell: 0, row: 'chord', hist: E.History(80), loop: null, kind: 'off', speed: 1, playing: false,
-    dur: 0, peaks: null, audioEl: null, grid: W.parseGrid(song.grid), win0: 0, taps: null, heard: null, analysing: false, clip: null, mic: false
+    dur: 0, peaks: null, audioEl: null, grid: W.parseGrid(song.grid), taps: null, follow: true, staffA: -1, memo: {}, heard: null, analysing: false, clip: null, mic: false
   };
   var narrow = !WS.isWide();
   if (narrow) root.classList.add('narrow');
@@ -52,112 +52,49 @@ WS.viewTranscribe = function (v) {
     add(headHost, WS.songHeader(song, 'transcribe', { sub: sub, right: h('div', { class: 'row', style: { gap: 0 } }, undo, redo) }));
   }
 
-  /* ----- sections strip + waveform ----- */
+  /* ----- sections strip + waveform (a window of bars that scrolls and follows playback) ----- */
   var secStrip = h('div', { class: 'sections' });
   var waveCard = h('div', { class: 'wave' });
-  var canvas = h('canvas'); var phEl = h('div', { class: 'ph' }), lpEl = h('div', { class: 'lp' });
   var emptyEl = h('div', { class: 'empty' });
-  waveCard.appendChild(canvas); waveCard.appendChild(lpEl); waveCard.appendChild(phEl); waveCard.appendChild(emptyEl);
+  waveCard.appendChild(emptyEl);
   var barnums = h('div', { class: 'barnums' });
+  var ovHost = h('div', { class: 'ovstrip', 'aria-label': 'Whole song. Tap to jump.' });
+  var zoomLbl = h('span', { class: 'small tabnum zlbl' });
+  var zoomOut = WS.ib('zout', 'Show more bars', function () { V.zoom(1); drawZoom(); }), zoomIn = WS.ib('zin', 'Show fewer bars', function () { V.zoom(-1); drawZoom(); });
+  var zoomRow = h('div', { class: 'wzoom' }, ovHost, zoomLbl, zoomOut, zoomIn);
   var gtools = h('div', { class: 'gridtools' });
+  function drawZoom() { zoomLbl.textContent = V.zoomLabel(); zoomOut.classList.toggle('dis', !V.canZoom(1)); zoomIn.classList.toggle('dis', !V.canZoom(-1)); }
 
   function nBars() { return T.sheet.bars.length; }
-  function win() { var n = Math.min(24, nBars()); var w0 = Math.max(0, Math.min(T.win0, nBars() - n)); return { w0: w0, n: n }; }
-  function ensureWin(i) { var n = Math.min(24, nBars()); if (i < T.win0 || i >= T.win0 + n) T.win0 = Math.floor(i / 12) * 12; if (T.win0 > nBars() - n) T.win0 = Math.max(0, nBars() - n); }
-  // time of a bar start inside the window (grid) or even spacing (no grid)
-  function barX(i, wd) {
-    var w = win(), W0 = wd;
-    if (T.grid && T.grid.b[w.w0] != null) {
-      var t0 = T.grid.b[w.w0], last = w.w0 + w.n, t1 = last < T.grid.b.length ? T.grid.b[last] : T.grid.end;
-      var t = i < T.grid.b.length ? T.grid.b[i] : T.grid.end;
-      return (t - t0) / Math.max(0.01, t1 - t0) * W0;
-    }
-    return (i - w.w0) / w.n * W0;
-  }
-  function timeAtX(x, wd) {
-    var w = win();
-    if (T.grid && T.grid.b[w.w0] != null) {
-      var t0 = T.grid.b[w.w0], last = w.w0 + w.n, t1 = last < T.grid.b.length ? T.grid.b[last] : T.grid.end;
-      return t0 + x / wd * (t1 - t0);
-    }
-    return null;
-  }
-  function barAtX(x, wd) {
-    var w = win();
-    for (var i = w.w0 + w.n - 1; i >= w.w0; i--) if (x >= barX(i, wd)) return i;
-    return w.w0;
-  }
-  function drawSections() {
-    WS.clear(secStrip);
-    var w = win(), wd = waveCard.clientWidth || 780;
-    var secs = W.sheetSections(T.sheet);
-    secs.forEach(function (s, k) {
-      var a = Math.max(s.from, w.w0), b = Math.min(s.to, w.w0 + w.n - 1);
-      if (a > b) return;
-      var x0 = barX(a, wd), x1 = barX(b + 1, wd);
-      var el = h('div', { class: 'sc', style: { left: x0 + 'px', width: Math.max(10, x1 - x0 - 3) + 'px', background: SECTION_TINTS[k % 3] }, text: s.label || s.mark || 'Start', onclick: function () { selectBar(s.from, true); } });
-      secStrip.appendChild(el);
-    });
-  }
+  var V = WS.WaveView({
+    host: waveCard, strip: secStrip, nums: barnums, ov: ovHost, zoomKey: 'ws-wzoom',
+    data: function () { return { grid: T.grid, nBars: nBars(), secs: W.sheetSections(T.sheet), sel: T.sel, loop: T.loop, peaks: T.peaks, dur: T.dur, pseudoSec: 60 / (Number(T.sheet.tempo) || 90) * barBeats() }; },
+    secColor: function (k) { return SECTION_TINTS[k % 3]; },
+    isPlaying: function () { return T.playing; },
+    onTap: function (t) {
+      if (T.playing) { /* the view already turned Follow off */ }
+      if (t.bar != null) selectBar(t.bar, false);
+      if (T.audioEl && t.time != null) T.audioEl.currentTime = t.time;
+    },
+    onSection: function (s) { if (T.playing && T.follow) V.setFollow(false); selectBar(s.from, true); },
+    onSeek: function (t) { if (T.audioEl) T.audioEl.currentTime = t; },
+    onFollow: function (on) { T.follow = on; drawFollowBtn(); if (on) { T.staffA = -1; drawStaff(); } },
+    onZoom: drawZoom
+  });
   function drawWave() {
-    var wd = waveCard.clientWidth || 780, hh = waveCard.clientHeight || 84, dpr = window.devicePixelRatio || 1;
-    canvas.width = Math.round(wd * dpr); canvas.height = Math.round(hh * dpr);
-    var c = canvas.getContext('2d'); c.setTransform(dpr, 0, 0, dpr, 0, 0); c.clearRect(0, 0, wd, hh);
-    var cs = getComputedStyle(document.documentElement);
-    var lineStrong = cs.getPropertyValue('--line').trim() || '#ddd', ink = cs.getPropertyValue('--wave').trim() || '#2C2F37';
-    var w = win();
-    // peaks
-    if (T.peaks && T.dur) {
-      var tA = T.grid && T.grid.b[w.w0] != null ? T.grid.b[w.w0] : 0;
-      var tB = T.grid ? (w.w0 + w.n < T.grid.b.length ? T.grid.b[w.w0 + w.n] : T.grid.end) : T.dur;
-      c.fillStyle = ink; c.globalAlpha = 0.78;
-      var cols = Math.floor(wd / 3.5);
-      for (var i = 0; i < cols; i++) {
-        var t = tA + (i + 0.5) / cols * (tB - tA), pi = Math.max(0, Math.min(T.peaks.length - 1, Math.floor(t / T.dur * T.peaks.length)));
-        var amp = Math.max(0.02, T.peaks[pi]) * (hh - 18);
-        c.fillRect(6 + i * (wd - 12) / cols, (hh - amp) / 2, Math.max(1.5, (wd - 12) / cols - 1.5), amp);
-      }
-      c.globalAlpha = 1;
-    }
-    // bar lines
-    for (var b = w.w0; b <= w.w0 + w.n; b++) {
-      var x = Math.round(barX(b, wd)) + 0.5;
-      c.strokeStyle = b % 4 === 0 ? lineStrong : lineStrong; c.globalAlpha = b % 4 === 0 ? 1 : 0.55;
-      c.beginPath(); c.moveTo(x, 0); c.lineTo(x, hh); c.stroke();
-    }
-    c.globalAlpha = 1;
-    // bar numbers
-    WS.clear(barnums);
-    for (var bn = w.w0; bn < w.w0 + w.n; bn++) {
-      var sp = h('span', { text: String(bn + 1), style: { left: (barX(bn, wd) + 3) + 'px' } });
-      if (bn === T.sel) { sp.style.color = 'var(--acc)'; sp.style.fontWeight = '700'; }
-      barnums.appendChild(sp);
-    }
-    drawLoopEl(wd);
+    V.refresh();
     emptyEl.style.display = T.peaks ? 'none' : 'flex';
     if (!T.peaks) {
       if (demo) emptyEl.textContent = 'The demo song has no audio. Bars still work: tap a bar to select it.';
       else if (!song.audio) emptyEl.textContent = 'No audio linked. Open More, Audio file, to link one from Drive.';
       else if (A.state(song.audio) !== 'device') emptyEl.textContent = 'The audio is in Drive. Download it to this device to see the waveform.';
       else emptyEl.textContent = 'Reading the audio…';
-      if (T.sel != null) {
-        // still show the selected bar
-        var sx = barX(T.sel, wd), ex = barX(T.sel + 1, wd);
-        lpEl.style.display = 'block'; lpEl.style.left = sx + 'px'; lpEl.style.width = Math.max(4, ex - sx) + 'px'; lpEl.style.background = 'var(--accs)';
-        emptyEl.style.alignItems = 'flex-end'; emptyEl.style.paddingBottom = '6px';
-      }
+      emptyEl.style.alignItems = 'flex-end'; emptyEl.style.paddingBottom = '6px'; emptyEl.style.pointerEvents = 'none';
     }
+    drawZoom();
   }
-  function drawLoopEl(wd) {
-    wd = wd || waveCard.clientWidth || 780;
-    var l = T.loop;
-    if (!l) { if (T.peaks) lpEl.style.display = 'none'; return; }
-    var w = win();
-    var a = Math.max(l[0], w.w0), b = Math.min(l[1], w.w0 + w.n - 1);
-    if (a > b) { lpEl.style.display = 'none'; return; }
-    var x0 = barX(a, wd), x1 = barX(b + 1, wd);
-    lpEl.style.display = 'block'; lpEl.style.left = x0 + 'px'; lpEl.style.width = Math.max(4, x1 - x0) + 'px'; lpEl.style.background = '';
-  }
+  function drawSections() { /* drawn by the view */ }
+  function drawLoopEl() { V.refresh(); }
   function drawGridTools() {
     WS.clear(gtools);
     if (demo) return;
@@ -255,21 +192,27 @@ WS.viewTranscribe = function (v) {
   /* ----- staff line ----- */
   var staffCard = h('div', { class: 'staffcard' });
   var staffH = null;
+  function barsPerLine() { return narrow && WS.isPhone() ? 2 : 4; }
+  // while playing with Follow on, the line shown is the one with the playing bar. Otherwise it is the selected bar's line.
+  function staffFocus() { return T.follow && T.playing && T.playBar != null ? T.playBar : T.sel; }
   function drawStaff() {
-    var bpl = narrow && WS.isPhone() ? 2 : 4;
-    var a = Math.floor(T.sel / bpl) * bpl, b = Math.min(nBars() - 1, a + bpl - 1);
+    var bpl = barsPerLine();
+    var a = Math.floor(staffFocus() / bpl) * bpl, b = Math.min(nBars() - 1, a + bpl - 1);
+    T.staffA = a;
     WNote.load().then(function () {
       var wd = (staffCard.clientWidth || 780) - 12;
       try {
-        staffH = WNote.render(staffCard, T.sheet, { width: wd, scale: 1, barsPerLine: bpl, ranges: [[a, b]], theme: document.documentElement.getAttribute('data-theme'), triangle: WS.lsGet('ws-tri', true), selected: T.sel, onBar: function (i) { selectBar(i); } });
+        staffH = WNote.render(staffCard, T.sheet, { width: wd, scale: 1, barsPerLine: bpl, ranges: [[a, b]], theme: document.documentElement.getAttribute('data-theme'), triangle: WS.lsGet('ws-tri', true), selected: T.sel, onBar: function (i) { userSelect(i); } });
         staffH.setLoop && T.loop && staffH.setLoop(T.loop[0], T.loop[1]);
-        if (T.playBar != null) staffH.setPlaying(T.playBar);
-      } catch (e) { console.error(e); staffH = WNote.renderGrid(staffCard, T.sheet, { ranges: [[a, b]], barsPerLine: bpl, onBar: function (i) { selectBar(i); } }); staffH.setSelected(T.sel); }
+        if (T.playBar != null) { staffH.setPlaying(T.playBar); if (T.playing && T.playFrac != null) staffH.setBeat(T.playBar, T.playFrac); }
+      } catch (e) { console.error(e); staffH = WNote.renderGrid(staffCard, T.sheet, { ranges: [[a, b]], barsPerLine: bpl, onBar: function (i) { userSelect(i); } }); staffH.setSelected(T.sel); }
     }).catch(function (e) {
-      staffH = WNote.renderGrid(staffCard, T.sheet, { ranges: [[a, b]], barsPerLine: bpl, onBar: function (i) { selectBar(i); } }); staffH.setSelected(T.sel);
+      staffH = WNote.renderGrid(staffCard, T.sheet, { ranges: [[a, b]], barsPerLine: bpl, onBar: function (i) { userSelect(i); } }); staffH.setSelected(T.sel);
       staffCard.insertBefore(h('p', { class: 'err', text: 'The notation library could not load (' + (e && e.message || e) + '). Showing a chord grid instead.' }), staffCard.firstChild);
     });
   }
+  // a bar tapped by hand while playing turns Follow off
+  function userSelect(i) { if (T.playing && T.follow) V.setFollow(false); selectBar(i); }
 
   /* ----- typed bars ----- */
   var typedInput = h('input', { type: 'text', 'aria-label': 'Type the bar', autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false', inputmode: 'text', placeholder: 'E . A .', enterkeyhint: 'next' });
@@ -535,7 +478,7 @@ WS.viewTranscribe = function (v) {
     if (i < 0 || i >= nBars()) return;
     if (T.sel !== i) commitTypedQuiet();
     T.sel = i; T.cell = Math.min(T.cell, ctxFor(i).units - 1);
-    ensureWin(i);
+    if (!(T.playing && T.follow)) V.reveal(i);
     if (seek && T.audioEl && T.grid && T.grid.b[i] != null) { T.audioEl.currentTime = T.grid.b[i]; }
     if (T.kind === 'bar') T.loop = [i, i]; else if (T.kind === 'sec') T.loop = sectionOf(i);
     refreshAll();
@@ -621,9 +564,23 @@ WS.viewTranscribe = function (v) {
   var speedChips = h('div', { class: 'chips' });
   var speedRange = h('input', { type: 'range', min: 40, max: 100, value: 100, 'aria-label': 'Speed', style: { width: '110px' } });
   speedRange.addEventListener('input', function () { setSpeed(Number(speedRange.value) / 100); });
+  var followBtn = h('button', { class: 'btn', type: 'button', onclick: function () { V.setFollow(!T.follow); } });
+  var gridNote = h('span', { class: 'small gridnote' });
+  function drawFollowBtn() {
+    followBtn.innerHTML = icon('follow') + '<span>Follow</span>';
+    followBtn.className = 'btn' + (T.follow ? ' acc' : '');
+    followBtn.setAttribute('aria-pressed', T.follow ? 'true' : 'false');
+    followBtn.setAttribute('aria-label', T.follow ? 'Follow is on. Tap to stop following the playhead.' : 'Follow is off. Tap to follow the playhead.');
+    gridNote.textContent = T.peaks && !T.grid ? 'Set the beat grid to follow bars.' : '';
+  }
+  function loopSecs() { return T.loop && T.grid ? [W.gridTimeAt(T.grid, T.loop[0], 0), W.gridBarEnd(T.grid, T.loop[1])] : null; }
+  function toStart() { if (!T.audioEl) { noAudioToast(); return; } WS.toStart(T.audioEl, loopSecs(), T.memo); if (T.follow) V.setFollow(true); }
+  function skip(d) { if (!T.audioEl) { noAudioToast(); return; } WS.seekBy(T.audioEl, d, loopSecs()); }
+  function noAudioToast() { toast(demo ? 'The demo song has no audio.' : (song.audio ? 'Download the audio to this device first (More, Audio file).' : 'Link an audio file first (More, Audio file).')); }
   var transport = h('div', { class: 'transport' },
-    h('button', { class: 'btn', type: 'button', text: '−5 s', onclick: function () { if (T.audioEl) T.audioEl.currentTime = Math.max(0, T.audioEl.currentTime - 5); } }), playBtnEl, loopBtn,
-    h('span', { class: 'small', text: 'Speed' }), speedChips, speedRange, h('span', { class: 'grow' }), timeEl);
+    h('div', { class: 'tgroup' }, WS.ib('tostart', 'Back to the start', toStart), WS.ib('back10', 'Back 10 seconds', function () { skip(-10); }), playBtnEl, WS.ib('fwd10', 'Forward 10 seconds', function () { skip(10); }), h('span', { class: 'grow' }), timeEl),
+    h('div', { class: 'tgroup' }, followBtn, loopBtn, gridNote),
+    h('div', { class: 'tgroup' }, h('span', { class: 'small', text: 'Speed' }), speedChips, speedRange));
   function drawTransportBits() {
     WS.clear(speedChips);
     [0.5, 0.75, 1].forEach(function (s) { speedChips.appendChild(h('button', { class: 'chip' + (Math.abs(T.speed - s) < 0.01 ? ' on' : ''), type: 'button', text: Math.round(s * 100) + '%', onclick: function () { setSpeed(s); } })); });
@@ -661,13 +618,19 @@ WS.viewTranscribe = function (v) {
       if (t >= b - 0.02) { el.currentTime = W.gridTimeAt(T.grid, T.loop[0], 0); t = el.currentTime; }
     }
     timeEl.textContent = WS.fmtTime(t) + ' / ' + WS.fmtTime(T.dur || el.duration || 0);
-    var wd = waveCard.clientWidth || 780, w = win();
     if (T.grid) {
       var g = W.gridBarAt(T.grid, t);
-      var pb = g.bar >= 0 ? g.bar : null;
-      if (pb !== T.playBar) { T.playBar = pb; if (staffH && staffH.setPlaying) staffH.setPlaying(pb); if (pb != null && T.playing && (pb < w.w0 || pb >= w.w0 + w.n)) { ensureWin(pb); drawSections(); drawWave(); } }
-      if (pb != null && pb >= w.w0 && pb < w.w0 + w.n) { phEl.style.display = 'block'; phEl.style.left = (barX(pb, wd) + (barX(pb + 1, wd) - barX(pb, wd)) * g.frac) + 'px'; } else phEl.style.display = 'none';
-    } else phEl.style.display = 'none';
+      var pb = g.bar >= 0 ? g.bar : (g.over ? null : 0);
+      T.playFrac = pb != null ? g.frac : null;
+      if (pb !== T.playBar) {
+        T.playBar = pb;
+        // VexFlow is slow, so the line is only drawn again when the playing bar moves to another line
+        if (T.follow && T.playing && pb != null && Math.floor(pb / barsPerLine()) * barsPerLine() !== T.staffA) drawStaff();
+        else if (staffH && staffH.setPlaying) staffH.setPlaying(pb);
+      }
+      if (staffH && staffH.setBeat) staffH.setBeat(T.playing && pb != null ? pb : null, g.frac);
+    } else { T.playBar = null; T.playFrac = null; }
+    V.tick(t, !el.paused);
     if (!el.paused) raf = requestAnimationFrame(tick); else raf = null;
   }
   function loadAudio() {
@@ -680,33 +643,24 @@ WS.viewTranscribe = function (v) {
         try { el.preservesPitch = true; el.webkitPreservesPitch = true; el.mozPreservesPitch = true; } catch (e) { /* ignore */ }
         T.audioEl = el;
         el.addEventListener('loadedmetadata', function () { T.dur = el.duration; tick(); });
-        el.addEventListener('play', function () { T.playing = true; drawTransportBits(); if (!raf) raf = requestAnimationFrame(tick); });
-        el.addEventListener('pause', function () { T.playing = false; drawTransportBits(); tick(); });
-        el.addEventListener('ended', function () { T.playing = false; drawTransportBits(); });
+        el.addEventListener('play', function () { T.playing = true; if (!T.follow) V.setFollow(true); drawTransportBits(); if (!raf) raf = requestAnimationFrame(tick); });
+        el.addEventListener('pause', function () { T.playing = false; drawTransportBits(); tick(); if (staffH && staffH.setBeat) staffH.setBeat(null); });
+        el.addEventListener('ended', function () { T.playing = false; drawTransportBits(); if (staffH && staffH.setBeat) staffH.setBeat(null); });
         el.addEventListener('error', function () { toast('This audio file could not be played. Try downloading it again.'); });
         el.addEventListener('seeked', tick);
-        return A.peaks(song.audio, 1200).then(function (p) { T.peaks = p.p; T.dur = p.dur; drawWave(); drawSections(); drawGridTools(); tick(); }).catch(function (e) { toast((e && e.message) || 'The waveform could not be drawn.'); drawWave(); });
+        return A.peaks(song.audio, 3000).then(function (p) { T.peaks = p.p; T.dur = p.dur; drawWave(); drawGridTools(); drawFollowBtn(); tick(); }).catch(function (e) { toast((e && e.message) || 'The waveform could not be drawn.'); drawWave(); });
       });
     }).catch(function (e) { toast((e && e.message) || 'The audio could not be opened.'); });
     drawGridTools(); drawTransportBits();
   }
-  // tap on the waveform
-  waveCard.addEventListener('click', function (e) {
-    var r = waveCard.getBoundingClientRect(), x = e.clientX - r.left, wd = r.width;
-    var bi = barAtX(x, wd);
-    selectBar(bi, false);
-    var tt = timeAtX(x, wd);
-    if (T.audioEl && tt != null) T.audioEl.currentTime = Math.max(0, tt);
-  });
-
   /* ----- assemble ----- */
-  function redrawBar() { refreshTypedLazy(); drawGrid(); drawPanel(); drawStaff(); drawSections(); drawWave(); paintTones(); }
+  function redrawBar() { refreshTypedLazy(); drawGrid(); drawPanel(); drawStaff(); drawWave(); paintTones(); }
   function refreshTypedLazy() { /* the typed field is the one being edited */ }
-  function refreshEdit() { refreshTyped(); drawGrid(); drawPanel(); drawStaff(); drawSections(); drawWave(); paintTones(); }
-  function refreshAll() { refreshTyped(); drawGrid(); drawPanel(); drawStaff(); drawSections(); drawWave(); drawGridTools(); drawTransportBits(); paintTones(); var pb = pianoBar.querySelector('.btn.pri'); if (pb) pb.textContent = 'Play ' + playLabel(); drawHead(); }
-  function redraw() { drawSections(); drawWave(); drawGridTools(); drawTransportBits(); }
+  function refreshEdit() { refreshTyped(); drawGrid(); drawPanel(); drawStaff(); drawWave(); paintTones(); }
+  function refreshAll() { refreshTyped(); drawGrid(); drawPanel(); drawStaff(); drawWave(); drawGridTools(); drawTransportBits(); drawFollowBtn(); paintTones(); var pb = pianoBar.querySelector('.btn.pri'); if (pb) pb.textContent = 'Play ' + playLabel(); drawHead(); }
+  function redraw() { drawWave(); drawGridTools(); drawTransportBits(); drawFollowBtn(); }
 
-  var topBox = h('div', { class: 'tr-top' }, secStrip, waveCard, barnums, transport);
+  var topBox = h('div', { class: 'tr-top' }, secStrip, waveCard, barnums, zoomRow, transport);
   var left = h('div', { class: 'tr-left' }, topBox, gtools, staffCard, typedWrap, gedit);
   var main = h('div', { class: 'tr-main' }, left, panel);
   add(root, headHost, main, pianoBar);
@@ -724,18 +678,19 @@ WS.viewTranscribe = function (v) {
     else if (e.key === ' ') { e.preventDefault(); togglePlay(); }
   }
   document.addEventListener('keydown', onKey);
-  var offResize = WS.on('resize', function () { drawStaff(); drawWave(); drawSections(); });
+  var offResize = WS.on('resize', function () { T.staffA = -1; drawStaff(); drawWave(); });
   var offAudio = WS.on('audio', function () { if (!T.audioEl) loadAudio(); });
   WS.onLeave(function () {
     persistSoon.flush(); commitTypedQuiet(); WS.saveSheet(song.id, T.sheet);
     document.removeEventListener('keydown', onKey); offResize(); offAudio();
     if (T.audioEl) { T.audioEl.pause(); T.audioEl = null; }
     if (raf) cancelAnimationFrame(raf);
+    V.destroy();
     if (T.mic && WS.Mic) WS.Mic.stop();
     if (WS.Midi) WS.Midi.onNote = null;
     Synth.allOff();
   });
-  window.__tr = T; T.api = { selectBar: selectBar, selectCell: selectCell, refreshAll: refreshAll, setChord: setChord, barOptions: barOptions, redraw: redraw };
+  window.__tr = T; T.V = V; T.api = { selectBar: selectBar, selectCell: selectCell, refreshAll: refreshAll, setChord: setChord, barOptions: barOptions, redraw: redraw };
   setTimeout(function () {
     drawHead(); buildPiano(); refreshAll(); loadAudio();
     if (WS.Midi && WS.Midi.autoStart) WS.Midi.autoStart();

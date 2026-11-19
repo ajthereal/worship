@@ -50,7 +50,12 @@ var ICON = {
   trash: '<path d="M5 7h14M10 7V4h4v3M7 7l1 13h8l1-13"/>', gear: '<circle cx="12" cy="12" r="3"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1"/>',
   help: '<circle cx="12" cy="12" r="9"/><path d="M9.5 9.5a2.5 2.5 0 114 2c-.8.6-1.5 1-1.5 2M12 17h0"/>', edit: '<path d="M4 20h4L19 9l-4-4L4 16z"/>',
   grid: '<rect x="4" y="4" width="7" height="7"/><rect x="13" y="4" width="7" height="7"/><rect x="4" y="13" width="7" height="7"/><rect x="13" y="13" width="7" height="7"/>',
-  staff: '<path d="M3 8h18M3 11h18M3 14h18M3 17h18"/>', play: '<path d="M7 4l13 8-13 8z" fill="currentColor"/>', pause: '<rect x="6" y="4" width="4" height="16" rx="1" fill="currentColor"/><rect x="14" y="4" width="4" height="16" rx="1" fill="currentColor"/>'
+  staff: '<path d="M3 8h18M3 11h18M3 14h18M3 17h18"/>', tostart: '<path d="M5 5v14"/><path d="M19 5L9 12l10 7z"/>',
+  back10: '<path d="M5 12a7.5 7.5 0 107.5-7.5H8"/><path d="M10.5 1.5L7.8 4.5l2.7 3"/><text x="12.5" y="15.2" font-size="7.5" font-weight="700" text-anchor="middle" fill="currentColor" stroke="none" font-family="sans-serif">10</text>',
+  fwd10: '<path d="M19 12a7.5 7.5 0 11-7.5-7.5H16"/><path d="M13.5 1.5l2.7 3-2.7 3"/><text x="11.5" y="15.2" font-size="7.5" font-weight="700" text-anchor="middle" fill="currentColor" stroke="none" font-family="sans-serif">10</text>',
+  follow: '<circle cx="12" cy="12" r="3"/><path d="M12 3v4M12 17v4M3 12h4M17 12h4"/>',
+  zin: '<path d="M12 6v12M6 12h12"/>', zout: '<path d="M6 12h12"/>',
+  play: '<path d="M7 4l13 8-13 8z" fill="currentColor"/>', pause: '<rect x="6" y="4" width="4" height="16" rx="1" fill="currentColor"/><rect x="14" y="4" width="4" height="16" rx="1" fill="currentColor"/>'
 };
 function icon(n) { return '<svg class="i" viewBox="0 0 24 24" aria-hidden="true">' + (ICON[n] || '') + '</svg>'; }
 function ib(n, label, fn, cls) { return h('button', { class: 'ib ' + (cls || ''), 'aria-label': label, title: label, html: icon(n), onclick: fn, type: 'button' }); }

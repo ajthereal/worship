@@ -1,12 +1,12 @@
 /* Worship service worker. Bump V when any app file changes, and the ?v= numbers in index.html (they must match). */
-const V = '4';
+const V = '5';
 const CACHE = 'worship-' + V;
 const FONTS = 'worship-fonts';
 const SHELL = [
   './', 'index.html', 'manifest.webmanifest',
   'core.js?v=' + V, 'css/app.css?v=' + V,
   'js/ui.js?v=' + V, 'js/demo.js?v=' + V, 'js/store.js?v=' + V, 'js/synth.js?v=' + V, 'js/edit.js?v=' + V, 'js/notation.js?v=' + V,
-  'js/audio.js?v=' + V, 'js/app.js?v=' + V, 'js/sets.js?v=' + V, 'js/live.js?v=' + V, 'js/piano.js?v=' + V, 'js/transcribe.js?v=' + V,
+  'js/audio.js?v=' + V, 'js/follow.js?v=' + V, 'js/app.js?v=' + V, 'js/sets.js?v=' + V, 'js/live.js?v=' + V, 'js/piano.js?v=' + V, 'js/transcribe.js?v=' + V,
   'js/practice.js?v=' + V, 'js/keys.js?v=' + V, 'js/pitch-worker.js', 'vendor/vexflow-bravura.js',
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png'
 ];
